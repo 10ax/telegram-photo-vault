@@ -1,0 +1,41 @@
+services:
+  telegram-photo-vault:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: telegram-photo-vault
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: sqlite+aiosqlite:////data/telegram_photo_vault.db
+      DATA_VOLUME_PATH: /data
+      API_KEY: ${API_KEY}
+      WORKER_DOWNLOAD_ROOT: /data/tmp
+      WORKER_COMPRESSED_ROOT: /data/compressed
+      WORKER_POLL_DELAY: ${WORKER_POLL_DELAY:-5}
+      WORKER_FILE_DELAY: ${WORKER_FILE_DELAY:-0}
+      WORKER_MAX_RETRIES: ${WORKER_MAX_RETRIES:-3}
+      WORKER_BATCH_SIZE: ${WORKER_BATCH_SIZE:-50}
+      MEGA_TARGET_FOLDER: ${MEGA_TARGET_FOLDER:-/Camera}
+      MEGA_EMAIL: ${MEGA_EMAIL}
+      MEGA_PASSWORD: ${MEGA_PASSWORD}
+      TELEGRAM_API_ID: ${TELEGRAM_API_ID}
+      TELEGRAM_API_HASH: ${TELEGRAM_API_HASH}
+      TELEGRAM_CHANNEL_ID: ${TELEGRAM_CHANNEL_ID}
+      TELEGRAM_SESSION_NAME: ${TELEGRAM_SESSION_NAME:-telegram_photo_vault}
+      TELEGRAM_SESSION_STRING: ${TELEGRAM_SESSION_STRING:-}
+      TELEGRAM_UPLOAD_DELAY: ${TELEGRAM_UPLOAD_DELAY:-5}
+      ODROID_HOST: ${ODROID_HOST}
+      ODROID_PORT: ${ODROID_PORT:-22}
+      ODROID_USERNAME: ${ODROID_USERNAME}
+      ODROID_PASSWORD: ${ODROID_PASSWORD:-}
+      ODROID_KEY_PATH: ${ODROID_KEY_PATH:-}
+      ODROID_KNOWN_HOSTS: ${ODROID_KNOWN_HOSTS}
+      ODROID_ALLOW_INSECURE_HOST_KEY: ${ODROID_ALLOW_INSECURE_HOST_KEY:-false}
+      ODROID_REMOTE_DIR: ${ODROID_REMOTE_DIR:-/srv/photo-vault}
+    volumes:
+      - ./data:/data
+      - ./mega-config:/root/.megaCmd
+    ports:
+      - "8000:8000"
