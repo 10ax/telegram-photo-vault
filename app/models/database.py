@@ -53,6 +53,11 @@ class Photo(Base):
         default=MediaType.IMAGE,
         nullable=False,
     )
+    # Step the photo was in when it was marked FAILED; used to resume on retry.
+    failed_status: Mapped[PhotoStatus | None] = mapped_column(
+        SqlEnum(PhotoStatus, name="failed_photo_status", native_enum=False),
+        nullable=True,
+    )
     tg_message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     retry_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     error_log: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -72,6 +77,7 @@ class Photo(Base):
 _COLUMN_MIGRATIONS: dict[str, dict[str, str]] = {
     "photos": {
         "media_type": "VARCHAR(5) NOT NULL DEFAULT 'IMAGE'",
+        "failed_status": "VARCHAR(15)",
     },
 }
 

@@ -4,6 +4,8 @@ import asyncio
 import logging
 import os
 import traceback
+from contextlib import suppress
+from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
 
 from sqlalchemy import select
@@ -26,6 +28,16 @@ ACTIVE_STATUSES = (
     PhotoStatus.ODROID_UPLOADED,
 )
 
+WORKER_MODES = ("interval", "manual")
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _iso(value: datetime | None) -> str | None:
+    return value.isoformat() if value is not None else None
+
 
 class PhotoWorker:
     def __init__(
@@ -37,43 +49,98 @@ class PhotoWorker:
         *,
         download_root: str | Path = "./data/tmp",
         compressed_root: str | Path = "./data/compressed",
-        poll_delay: float = 5.0,
+        mode: str = "interval",
+        run_interval: float = 900.0,
         per_file_delay: float = 1.0,
         max_retries: int = 3,
         batch_size: int = 50,
     ) -> None:
+        if mode not in WORKER_MODES:
+            raise ValueError(f"Unsupported worker mode: {mode!r} (expected one of {WORKER_MODES})")
+
         self.mega_service = mega_service
         self.telegram_service = telegram_service
         self.sftp_service = sftp_service
         self.odroid_remote_dir = odroid_remote_dir
         self.download_root = Path(download_root)
         self.compressed_root = Path(compressed_root)
-        self.poll_delay = poll_delay
+        self.mode = mode
+        self.run_interval = run_interval
         self.per_file_delay = per_file_delay
         self.max_retries = max_retries
         self.batch_size = batch_size
 
+        self.running = False
+        self.last_run_started_at: datetime | None = None
+        self.last_run_finished_at: datetime | None = None
+        self.next_run_at: datetime | None = None
+        self.last_run_error: str | None = None
+        self._wake = asyncio.Event()
+
         self.download_root.mkdir(parents=True, exist_ok=True)
         self.compressed_root.mkdir(parents=True, exist_ok=True)
 
+    def trigger(self) -> None:
+        self._wake.set()
+
+    def status_snapshot(self) -> dict[str, object]:
+        return {
+            "mode": self.mode,
+            "run_interval_seconds": self.run_interval,
+            "running": self.running,
+            "last_run_started_at": _iso(self.last_run_started_at),
+            "last_run_finished_at": _iso(self.last_run_finished_at),
+            "next_run_at": _iso(self.next_run_at),
+            "last_run_error": self.last_run_error,
+        }
+
     async def run_forever(self) -> None:
         while True:
-            try:
-                await self._discover_new_files()
+            self._wake.clear()
+            await self._run_guarded()
 
-                photo_ids = await self._fetch_active_photo_ids()
-                if not photo_ids:
-                    await asyncio.sleep(self.poll_delay)
-                    continue
+            if self.mode == "interval":
+                self.next_run_at = _utcnow() + timedelta(seconds=self.run_interval)
+                with suppress(asyncio.TimeoutError):
+                    await asyncio.wait_for(self._wake.wait(), timeout=self.run_interval)
+            else:
+                self.next_run_at = None
+                await self._wake.wait()
 
-                for photo_id in photo_ids:
-                    await self._process_photo_by_id(photo_id)
+    async def _run_guarded(self) -> None:
+        self.running = True
+        self.last_run_started_at = _utcnow()
+        try:
+            await self.run_once()
+            self.last_run_error = None
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Worker run failed.")
+            self.last_run_error = traceback.format_exc()
+        finally:
+            self.running = False
+            self.last_run_finished_at = _utcnow()
+
+    async def run_once(self) -> None:
+        await self._discover_new_files()
+
+        # Drain the pipeline: keep making passes while at least one photo advances.
+        # A pass with zero progress means every remaining photo is erroring; leave
+        # them for the next scheduled run instead of spinning.
+        while True:
+            photo_ids = await self._fetch_active_photo_ids()
+            if not photo_ids:
+                return
+
+            progressed = False
+            for photo_id in photo_ids:
+                progressed = await self._process_photo_by_id(photo_id) or progressed
+                if self.per_file_delay > 0:
                     await asyncio.sleep(self.per_file_delay)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.exception("Worker loop failed; retrying after delay.")
-                await asyncio.sleep(self.poll_delay)
+
+            if not progressed:
+                return
 
     async def _discover_new_files(self) -> int:
         remote_paths = sorted(set(await self.mega_service.list_new_files()))
@@ -128,26 +195,30 @@ class PhotoWorker:
             )
             return list(result)
 
-    async def _process_photo_by_id(self, photo_id: int) -> None:
+    async def _process_photo_by_id(self, photo_id: int) -> bool:
         async with AsyncSessionLocal() as session:
             photo = await session.get(Photo, photo_id)
             if photo is None or photo.status not in ACTIVE_STATUSES:
-                return
+                return False
 
             try:
                 await self._run_step(photo)
                 photo.retry_count = 0
                 photo.error_log = None
+                stepped = True
             except asyncio.CancelledError:
                 raise
             except Exception:
+                stepped = False
                 photo.retry_count += 1
                 photo.error_log = traceback.format_exc()
                 if photo.retry_count >= self.max_retries:
+                    photo.failed_status = photo.status
                     photo.status = PhotoStatus.FAILED
                 logger.exception("Failed processing photo id=%s", photo.id)
 
             await session.commit()
+            return stepped
 
     async def _run_step(self, photo: Photo) -> None:
         if photo.status == PhotoStatus.PENDING:

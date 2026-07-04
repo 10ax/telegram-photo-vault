@@ -1,0 +1,340 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Telegram Photo Vault</title>
+<style>
+  :root {
+    --page:           #f9f9f7;
+    --surface:        #fcfcfb;
+    --ink:            #0b0b0b;
+    --ink-2:          #52514e;
+    --muted:          #898781;
+    --hairline:       #e1e0d9;
+    --border:         rgba(11, 11, 11, 0.10);
+    --accent:         #2a78d6;
+    --meter-fill:     #256abf;
+    --good:           #0ca30c;
+    --warning:        #fab219;
+    --serious:        #ec835a;
+    --critical:       #d03b3b;
+    --good-text:      #006300;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --page:       #0d0d0d;
+      --surface:    #1a1a19;
+      --ink:        #ffffff;
+      --ink-2:      #c3c2b7;
+      --muted:      #898781;
+      --hairline:   #2c2c2a;
+      --border:     rgba(255, 255, 255, 0.10);
+      --accent:     #3987e5;
+      --meter-fill: #3987e5;
+      --good-text:  #0ca30c;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--page);
+    color: var(--ink);
+    font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  main { max-width: 1080px; margin: 0 auto; padding: 20px 16px 48px; }
+  header {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 12px;
+    margin-bottom: 20px;
+  }
+  header h1 { font-size: 18px; font-weight: 650; margin: 0; flex: 1; }
+  #key-bar { display: flex; gap: 8px; align-items: center; }
+  #key-bar.needs-key input { outline: 2px solid var(--critical); }
+  input[type="password"] {
+    background: var(--surface); color: var(--ink);
+    border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px; width: 200px;
+  }
+  button {
+    background: var(--surface); color: var(--ink);
+    border: 1px solid var(--border); border-radius: 6px;
+    padding: 6px 12px; font: inherit; cursor: pointer;
+  }
+  button:hover { border-color: var(--muted); }
+  button:disabled { opacity: 0.5; cursor: default; }
+  button.primary { background: var(--accent); border-color: transparent; color: #fff; }
+  button.danger  { color: var(--critical); }
+
+  .grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); }
+  .cards { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); margin-top: 12px; }
+  section.card, .tile {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 14px 16px;
+  }
+  .tile .label { color: var(--ink-2); font-size: 12px; display: flex; align-items: center; gap: 6px; }
+  .tile .value { font-size: 26px; font-weight: 650; margin-top: 2px; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex: none; }
+  h2 { font-size: 13px; font-weight: 650; color: var(--ink-2); margin: 0 0 10px; text-transform: uppercase; letter-spacing: 0.04em; }
+  dl { display: grid; grid-template-columns: max-content 1fr; gap: 4px 14px; margin: 0; }
+  dt { color: var(--muted); }
+  dd { margin: 0; color: var(--ink-2); font-variant-numeric: tabular-nums; }
+  .state { display: inline-flex; align-items: center; gap: 6px; color: var(--ink); }
+  .actions { display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; }
+
+  .meter { height: 10px; border-radius: 5px; background: var(--hairline); overflow: hidden; margin: 8px 0 6px; }
+  .meter > div { height: 100%; border-radius: 5px 0 0 5px; background: var(--meter-fill); width: 0; transition: width 0.4s; }
+  .meter-note { color: var(--ink-2); font-size: 12px; }
+
+  table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+  th { text-align: left; color: var(--muted); font-weight: 500; font-size: 12px; padding: 6px 8px; border-bottom: 1px solid var(--hairline); }
+  td { padding: 7px 8px; border-bottom: 1px solid var(--hairline); vertical-align: top; }
+  tr:last-child td { border-bottom: none; }
+  td.path { max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  details summary { cursor: pointer; color: var(--ink-2); }
+  details pre {
+    white-space: pre-wrap; word-break: break-word; font-size: 11px;
+    background: var(--page); border: 1px solid var(--hairline); border-radius: 6px; padding: 8px;
+    max-height: 220px; overflow: auto;
+  }
+  .empty { color: var(--muted); padding: 12px 8px; }
+  #toast {
+    position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%);
+    background: var(--ink); color: var(--page); border-radius: 8px; padding: 8px 14px;
+    opacity: 0; transition: opacity 0.25s; pointer-events: none; max-width: 90vw;
+  }
+  #toast.show { opacity: 1; }
+  .wide { grid-column: 1 / -1; margin-top: 12px; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Telegram Photo Vault</h1>
+    <div id="key-bar">
+      <input id="api-key" type="password" placeholder="API key" autocomplete="off">
+      <button id="save-key">Save</button>
+    </div>
+  </header>
+
+  <div class="grid" id="tiles"></div>
+
+  <div class="cards">
+    <section class="card" id="worker-card">
+      <h2>Worker</h2>
+      <dl>
+        <dt>State</dt><dd id="w-state">–</dd>
+        <dt>Mode</dt><dd id="w-mode">–</dd>
+        <dt>Last run</dt><dd id="w-last">–</dd>
+        <dt>Next run</dt><dd id="w-next">–</dd>
+      </dl>
+      <div id="w-error"></div>
+      <div class="actions"><button class="primary" id="run-now">Run now</button></div>
+    </section>
+
+    <section class="card" id="disk-card">
+      <h2>Disk (<span id="d-path">/data</span>)</h2>
+      <div class="meter"><div id="d-fill"></div></div>
+      <div class="meter-note" id="d-note">–</div>
+    </section>
+
+    <section class="card" id="recovery-card">
+      <h2>Channel recovery</h2>
+      <dl id="r-stats"><dt>State</dt><dd id="r-state">–</dd></dl>
+      <div class="actions">
+        <button id="r-scan">Scan channel</button>
+        <button id="r-dry">Dry run</button>
+        <button class="danger" id="r-run">Tidy (re-upload + delete)</button>
+      </div>
+    </section>
+  </div>
+
+  <section class="card wide">
+    <h2>Failed items</h2>
+    <div style="overflow-x:auto">
+      <table>
+        <thead><tr><th>ID</th><th>File</th><th>Type</th><th>Failed step</th><th>Updated</th><th>Error</th><th></th></tr></thead>
+        <tbody id="failed-rows"></tbody>
+      </table>
+    </div>
+    <div class="empty" id="failed-empty" hidden>Nothing has failed.</div>
+  </section>
+</main>
+<div id="toast"></div>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const KEY_STORAGE = "vault_api_key";
+
+// Pipeline display order; unknown statuses from newer versions are appended as-is.
+const STATUS_ORDER = ["PENDING", "DOWNLOADED", "CHUNK_UPLOADING", "TG_UPLOADED",
+                      "COMPRESSED", "ODROID_UPLOADED", "COMPLETED", "FAILED", "SKIPPED"];
+const STATUS_DOTS = { COMPLETED: "var(--good)", FAILED: "var(--critical)", SKIPPED: "var(--muted)" };
+
+let timer = null;
+
+function toast(message) {
+  const el = $("toast");
+  el.textContent = message;
+  el.classList.add("show");
+  setTimeout(() => el.classList.remove("show"), 3500);
+}
+
+async function api(path, options = {}) {
+  const key = localStorage.getItem(KEY_STORAGE) || "";
+  const response = await fetch(path, {
+    ...options,
+    headers: { "X-Api-Key": key, "Content-Type": "application/json", ...(options.headers || {}) },
+  });
+  if (response.status === 401 || response.status === 503 && path === "/api/status") {
+    $("key-bar").classList.add("needs-key");
+  }
+  if (!response.ok) {
+    let detail = response.statusText;
+    try { detail = (await response.json()).detail || detail; } catch (e) { /* ignore */ }
+    throw new Error(detail);
+  }
+  $("key-bar").classList.remove("needs-key");
+  return response.json();
+}
+
+function fmtTime(iso) {
+  if (!iso) return "–";
+  const then = new Date(iso);
+  const deltaSeconds = Math.round((then - Date.now()) / 1000);
+  const abs = Math.abs(deltaSeconds);
+  const rel = abs < 60 ? `${abs}s` : abs < 3600 ? `${Math.round(abs / 60)}m` : `${(abs / 3600).toFixed(1)}h`;
+  return `${then.toLocaleTimeString()} (${deltaSeconds <= 0 ? rel + " ago" : "in " + rel})`;
+}
+
+function renderTiles(counts) {
+  const keys = [...STATUS_ORDER.filter(k => k in counts),
+                ...Object.keys(counts).filter(k => !STATUS_ORDER.includes(k))];
+  $("tiles").innerHTML = keys.map(key => `
+    <div class="tile">
+      <div class="label"><span class="dot" style="background:${STATUS_DOTS[key] || "var(--accent)"}"></span>${key.replaceAll("_", " ")}</div>
+      <div class="value">${counts[key]}</div>
+    </div>`).join("");
+}
+
+function renderWorker(worker) {
+  if (!worker) { $("w-state").textContent = "not running"; return; }
+  $("w-state").innerHTML = worker.running
+    ? '<span class="state"><span class="dot" style="background:var(--good)"></span>running</span>'
+    : '<span class="state"><span class="dot"></span>idle</span>';
+  $("w-mode").textContent = worker.mode === "interval"
+    ? `every ${Math.round(worker.run_interval_seconds / 60)} min`
+    : "manual (on demand only)";
+  $("w-last").textContent = fmtTime(worker.last_run_finished_at || worker.last_run_started_at);
+  $("w-next").textContent = worker.running ? "now" : fmtTime(worker.next_run_at);
+  $("w-error").innerHTML = worker.last_run_error
+    ? `<details><summary>Last run failed</summary><pre>${escapeHtml(worker.last_run_error)}</pre></details>`
+    : "";
+}
+
+function renderDisk(system) {
+  const percent = system.used_percent;
+  const fill = $("d-fill");
+  fill.style.width = `${percent}%`;
+  let color = "var(--meter-fill)", note = "";
+  if (percent >= 95) { color = "var(--critical)"; note = " — disk critically full"; }
+  else if (percent >= 85) { color = "var(--warning)"; note = " — disk almost full"; }
+  fill.style.background = color;
+  $("d-path").textContent = system.path;
+  const freeGb = (system.free_bytes / 1e9).toFixed(1);
+  $("d-note").textContent = `${percent}% used, ${freeGb} GB free${note}`;
+}
+
+function renderRecovery(recovery) {
+  if (!recovery) {
+    $("r-state").textContent = "unavailable";
+    for (const id of ["r-scan", "r-dry", "r-run"]) $(id).disabled = true;
+    return;
+  }
+  for (const id of ["r-scan", "r-dry", "r-run"]) $(id).disabled = recovery.running;
+  const counts = recovery.items || {};
+  const stats = Object.entries(counts).filter(([, count]) => count > 0)
+    .map(([key, count]) => `<dt>${key.toLowerCase()}</dt><dd>${count}</dd>`).join("");
+  $("r-stats").innerHTML =
+    `<dt>State</dt><dd>${recovery.running ? (recovery.activity || "running") : "idle"}</dd>` + stats +
+    (recovery.last_error ? `<dt>error</dt><dd>${escapeHtml(recovery.last_error).slice(0, 300)}</dd>` : "");
+}
+
+function escapeHtml(text) {
+  return String(text).replace(/[&<>"']/g, c =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+function renderFailed(payload) {
+  const rows = payload.items.map(item => `
+    <tr>
+      <td>${item.id}</td>
+      <td class="path" title="${escapeHtml(item.mega_path)}">${escapeHtml(item.mega_path.split("/").pop())}</td>
+      <td>${item.media_type}</td>
+      <td>${item.failed_status || "?"}</td>
+      <td>${item.updated_at ? new Date(item.updated_at + (item.updated_at.endsWith("Z") ? "" : "Z")).toLocaleString() : "–"}</td>
+      <td>${item.error_log ? `<details><summary>show</summary><pre>${escapeHtml(item.error_log)}</pre></details>` : "–"}</td>
+      <td><button data-retry="${item.id}">Retry</button></td>
+    </tr>`);
+  $("failed-rows").innerHTML = rows.join("");
+  $("failed-empty").hidden = payload.total > 0;
+}
+
+async function refresh() {
+  try {
+    const [statusData, systemData, failedData] = await Promise.all([
+      api("/api/status"),
+      api("/api/system"),
+      api("/api/photos?status=FAILED&limit=20"),
+    ]);
+    renderTiles(statusData.photos || {});
+    renderWorker(statusData.worker);
+    renderRecovery(statusData.recovery);
+    renderDisk(systemData);
+    renderFailed(failedData);
+  } catch (error) {
+    toast(`Refresh failed: ${error.message}`);
+  }
+}
+
+async function post(path, body, confirmMessage) {
+  if (confirmMessage && !window.confirm(confirmMessage)) return;
+  try {
+    await api(path, { method: "POST", body: body ? JSON.stringify(body) : undefined });
+    toast("OK");
+    refresh();
+  } catch (error) {
+    toast(error.message);
+  }
+}
+
+$("save-key").addEventListener("click", () => {
+  localStorage.setItem(KEY_STORAGE, $("api-key").value.trim());
+  toast("API key saved");
+  refresh();
+});
+$("run-now").addEventListener("click", () => post("/api/run"));
+$("r-scan").addEventListener("click", () => post("/api/recovery/scan"));
+$("r-dry").addEventListener("click", () => post("/api/recovery/run", { dry_run: true }));
+$("r-run").addEventListener("click", () => post("/api/recovery/run", { dry_run: false },
+  "Re-upload tidied copies AND DELETE the original channel messages. Continue?"));
+$("failed-rows").addEventListener("click", (event) => {
+  const id = event.target.dataset && event.target.dataset.retry;
+  if (id) post(`/api/photos/${id}/retry`);
+});
+
+function startPolling() {
+  if (timer) clearInterval(timer);
+  timer = setInterval(refresh, 5000);
+  refresh();
+}
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) { clearInterval(timer); timer = null; }
+  else startPolling();
+});
+if (localStorage.getItem(KEY_STORAGE)) $("api-key").value = localStorage.getItem(KEY_STORAGE);
+startPolling();
+</script>
+</body>
+</html>

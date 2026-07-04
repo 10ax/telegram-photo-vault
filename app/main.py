@@ -4,8 +4,10 @@ import asyncio
 import logging
 import os
 from contextlib import asynccontextmanager, suppress
+from pathlib import Path
 
 from fastapi import FastAPI
+from fastapi.responses import FileResponse
 from pyrogram import Client
 
 logging.basicConfig(
@@ -104,13 +106,15 @@ async def lifespan(app: FastAPI):
             odroid_remote_dir=os.getenv("ODROID_REMOTE_DIR", "/srv/photo-vault"),
             download_root=os.getenv("WORKER_DOWNLOAD_ROOT", "/data/tmp"),
             compressed_root=os.getenv("WORKER_COMPRESSED_ROOT", "/data/compressed"),
-            poll_delay=float(os.getenv("WORKER_POLL_DELAY", "5")),
+            mode=os.getenv("WORKER_MODE", "interval"),
+            run_interval=float(os.getenv("WORKER_RUN_INTERVAL", "900")),
             per_file_delay=float(os.getenv("WORKER_FILE_DELAY", "0")),
             max_retries=int(os.getenv("WORKER_MAX_RETRIES", "3")),
             batch_size=int(os.getenv("WORKER_BATCH_SIZE", "50")),
         )
 
         worker_task = asyncio.create_task(worker.run_forever(), name="photo-worker")
+        app.state.worker = worker
         app.state.worker_task = worker_task
         app.state.telegram_client = telegram_client
 
@@ -126,6 +130,13 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Telegram Photo Vault", lifespan=lifespan)
 app.include_router(api_router)
+
+STATIC_DIR = Path(__file__).resolve().parent / "static"
+
+
+@app.get("/", include_in_schema=False)
+async def dashboard() -> FileResponse:
+    return FileResponse(STATIC_DIR / "dashboard.html")
 
 
 @app.get("/health")
