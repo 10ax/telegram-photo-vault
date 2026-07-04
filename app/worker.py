@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import traceback
@@ -8,21 +9,40 @@ from contextlib import suppress
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.exc import IntegrityError
 
-from app.models.database import AsyncSessionLocal, MediaType, Photo, PhotoStatus
+from app.models.database import (
+    AsyncSessionLocal,
+    ChunkStatus,
+    MediaType,
+    Photo,
+    PhotoStatus,
+    UploadChunk,
+)
+from app.services.chunking import (
+    ChunkWindow,
+    DEFAULT_CHUNK_SIZE,
+    build_chunk_caption,
+    build_manifest,
+    build_manifest_caption,
+    chunk_name,
+    compute_hashes,
+    manifest_name,
+    plan_chunks,
+)
 from app.services.image import compress_to_webp
 from app.services.media import detect_media_type
 from app.services.mega import MegaCmdError, MegaService
 from app.services.sftp import SFTPService
-from app.services.telegram import TelegramService
+from app.services.telegram import TelegramService, extract_datetime_with_source, format_date_caption
 
 logger = logging.getLogger(__name__)
 
 ACTIVE_STATUSES = (
     PhotoStatus.PENDING,
     PhotoStatus.DOWNLOADED,
+    PhotoStatus.CHUNK_UPLOADING,
     PhotoStatus.TG_UPLOADED,
     PhotoStatus.COMPRESSED,
     PhotoStatus.ODROID_UPLOADED,
@@ -54,6 +74,8 @@ class PhotoWorker:
         per_file_delay: float = 1.0,
         max_retries: int = 3,
         batch_size: int = 50,
+        chunk_size: int = DEFAULT_CHUNK_SIZE,
+        chunk_threshold: int = 1_950_000_000,
     ) -> None:
         if mode not in WORKER_MODES:
             raise ValueError(f"Unsupported worker mode: {mode!r} (expected one of {WORKER_MODES})")
@@ -69,6 +91,8 @@ class PhotoWorker:
         self.per_file_delay = per_file_delay
         self.max_retries = max_retries
         self.batch_size = batch_size
+        self.chunk_size = chunk_size
+        self.chunk_threshold = chunk_threshold
 
         self.running = False
         self.last_run_started_at: datetime | None = None
@@ -202,7 +226,7 @@ class PhotoWorker:
                 return False
 
             try:
-                await self._run_step(photo)
+                await self._run_step(session, photo)
                 photo.retry_count = 0
                 photo.error_log = None
                 stepped = True
@@ -220,13 +244,17 @@ class PhotoWorker:
             await session.commit()
             return stepped
 
-    async def _run_step(self, photo: Photo) -> None:
+    async def _run_step(self, session, photo: Photo) -> None:
         if photo.status == PhotoStatus.PENDING:
             await self._handle_pending(photo)
             return
 
         if photo.status == PhotoStatus.DOWNLOADED:
-            await self._handle_downloaded(photo)
+            await self._handle_downloaded(session, photo)
+            return
+
+        if photo.status == PhotoStatus.CHUNK_UPLOADING:
+            await self._handle_chunk_uploading(session, photo)
             return
 
         if photo.status == PhotoStatus.TG_UPLOADED:
@@ -254,7 +282,7 @@ class PhotoWorker:
         photo.local_path = str(downloaded_path)
         photo.status = PhotoStatus.DOWNLOADED
 
-    async def _handle_downloaded(self, photo: Photo) -> None:
+    async def _handle_downloaded(self, session, photo: Photo) -> None:
         if not photo.local_path:
             raise ValueError(f"Photo id={photo.id} is DOWNLOADED but local_path is empty.")
 
@@ -262,9 +290,158 @@ class PhotoWorker:
         if not local_path.is_file():
             raise FileNotFoundError(f"Downloaded file not found: {local_path}")
 
+        total_size = local_path.stat().st_size
+        if total_size > self.chunk_threshold:
+            await self._prepare_chunks(session, photo, local_path, total_size)
+            return
+
         message = await self.telegram_service.upload_document(local_path)
         photo.tg_message_id = message.id
         photo.status = PhotoStatus.TG_UPLOADED
+
+    async def _prepare_chunks(
+        self, session, photo: Photo, local_path: Path, total_size: int
+    ) -> None:
+        logger.info(
+            "File %s is %s bytes (> %s): splitting into chunks.",
+            local_path.name,
+            total_size,
+            self.chunk_threshold,
+        )
+        whole_sha, chunk_hashes = await asyncio.to_thread(
+            compute_hashes, local_path, self.chunk_size
+        )
+        plan = plan_chunks(total_size, self.chunk_size)
+        if len(plan) != len(chunk_hashes):
+            raise RuntimeError(
+                f"Chunk plan/hash mismatch for {local_path}: {len(plan)} vs {len(chunk_hashes)}"
+            )
+
+        # Idempotency: a retried prepare replaces any rows from a partial attempt.
+        await session.execute(delete(UploadChunk).where(UploadChunk.photo_id == photo.id))
+
+        count = len(plan)
+        for spec, sha in zip(plan, chunk_hashes):
+            session.add(
+                UploadChunk(
+                    photo_id=photo.id,
+                    part_index=spec["index"],
+                    part_count=count,
+                    offset=spec["offset"],
+                    size=spec["size"],
+                    sha256=sha,
+                    filename=chunk_name(local_path.name, spec["index"], count),
+                )
+            )
+
+        photo.is_chunked = True
+        photo.sha256 = whole_sha
+        photo.total_size = total_size
+        photo.status = PhotoStatus.CHUNK_UPLOADING
+
+    async def _handle_chunk_uploading(self, session, photo: Photo) -> None:
+        if not photo.local_path:
+            raise ValueError(f"Photo id={photo.id} is CHUNK_UPLOADING but local_path is empty.")
+
+        local_path = Path(photo.local_path)
+        if not local_path.is_file():
+            raise FileNotFoundError(f"Source file for chunk upload not found: {local_path}")
+
+        capture_datetime, capture_source = await extract_datetime_with_source(local_path)
+        date_caption = format_date_caption(capture_datetime)
+
+        chunk = await session.scalar(
+            select(UploadChunk)
+            .where(UploadChunk.photo_id == photo.id, UploadChunk.status == ChunkStatus.PENDING)
+            .order_by(UploadChunk.part_index)
+            .limit(1)
+        )
+
+        if chunk is None:
+            # All chunks are up: the manifest is the commit marker for the set.
+            await self._upload_manifest(
+                session, photo, local_path, date_caption, capture_datetime, capture_source
+            )
+            return
+
+        if chunk.tg_message_id is None:
+            # Close the crash window between send and commit: reuse an
+            # already-uploaded chunk instead of duplicating it.
+            existing = await self.telegram_service.find_document_by_name(chunk.filename)
+            if existing is not None:
+                logger.info("Chunk %s already in channel; reusing message %s.", chunk.filename, existing.id)
+                chunk.tg_message_id = existing.id
+                chunk.status = ChunkStatus.UPLOADED
+                return
+
+        caption = build_chunk_caption(
+            date_caption,
+            index=chunk.part_index,
+            count=chunk.part_count,
+            original_filename=local_path.name,
+            total_size=photo.total_size or 0,
+            sha256=photo.sha256 or "",
+        )
+        window = ChunkWindow(local_path, chunk.offset, chunk.size, chunk.filename)
+        try:
+            message = await self.telegram_service.upload_file_object(window, caption)
+        finally:
+            window.close()
+
+        chunk.tg_message_id = message.id
+        chunk.status = ChunkStatus.UPLOADED
+        logger.info("Uploaded chunk %s (%s/%s).", chunk.filename, chunk.part_index, chunk.part_count)
+
+    async def _upload_manifest(
+        self,
+        session,
+        photo: Photo,
+        local_path: Path,
+        date_caption: str,
+        capture_datetime: datetime,
+        capture_source: str,
+    ) -> None:
+        chunks = (
+            await session.scalars(
+                select(UploadChunk)
+                .where(UploadChunk.photo_id == photo.id)
+                .order_by(UploadChunk.part_index)
+            )
+        ).all()
+        if not chunks:
+            raise RuntimeError(f"Photo id={photo.id} is CHUNK_UPLOADING but has no chunk rows.")
+
+        manifest = build_manifest(
+            original_filename=local_path.name,
+            total_size=photo.total_size or local_path.stat().st_size,
+            sha256=photo.sha256 or "",
+            chunk_size=self.chunk_size,
+            chunks=[
+                {
+                    "index": chunk.part_index,
+                    "filename": chunk.filename,
+                    "offset": chunk.offset,
+                    "size": chunk.size,
+                    "sha256": chunk.sha256,
+                    "tg_message_id": chunk.tg_message_id,
+                }
+                for chunk in chunks
+            ],
+            mega_path=photo.mega_path,
+            mtime_utc=datetime.fromtimestamp(local_path.stat().st_mtime, tz=timezone.utc),
+            capture_datetime=capture_datetime,
+            capture_datetime_source=capture_source,
+        )
+
+        message = await self.telegram_service.upload_bytes(
+            json.dumps(manifest, indent=2).encode("utf-8"),
+            file_name=manifest_name(local_path.name),
+            caption=build_manifest_caption(date_caption, original_filename=local_path.name),
+        )
+        photo.manifest_tg_message_id = message.id
+        photo.tg_message_id = message.id
+        photo.status = PhotoStatus.TG_UPLOADED
+        logger.info("Uploaded manifest for %s (%s chunks).", local_path.name, len(chunks))
 
     async def _handle_tg_uploaded(self, photo: Photo) -> None:
         if not photo.local_path:

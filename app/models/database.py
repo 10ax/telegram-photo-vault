@@ -4,7 +4,18 @@ import os
 from datetime import datetime
 from enum import Enum
 
-from sqlalchemy import BigInteger, DateTime, Enum as SqlEnum, Integer, String, Text, func
+from sqlalchemy import (
+    BigInteger,
+    Boolean,
+    DateTime,
+    Enum as SqlEnum,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    func,
+)
 from sqlalchemy.ext.asyncio import AsyncAttrs, AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -21,6 +32,7 @@ class Base(AsyncAttrs, DeclarativeBase):
 class PhotoStatus(str, Enum):
     PENDING = "PENDING"
     DOWNLOADED = "DOWNLOADED"
+    CHUNK_UPLOADING = "CHUNK_UPLOADING"
     TG_UPLOADED = "TG_UPLOADED"
     COMPRESSED = "COMPRESSED"
     ODROID_UPLOADED = "ODROID_UPLOADED"
@@ -70,8 +82,49 @@ class Photo(Base):
         nullable=True,
     )
     tg_message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    is_chunked: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    total_size: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    manifest_tg_message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     retry_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     error_log: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+
+class ChunkStatus(str, Enum):
+    PENDING = "PENDING"
+    UPLOADED = "UPLOADED"
+
+
+class UploadChunk(Base):
+    __tablename__ = "upload_chunks"
+    __table_args__ = (UniqueConstraint("photo_id", "part_index", name="uq_chunk_photo_part"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    photo_id: Mapped[int] = mapped_column(
+        ForeignKey("photos.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    part_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    part_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    offset: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    size: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    filename: Mapped[str] = mapped_column(String(600), nullable=False)
+    status: Mapped[ChunkStatus] = mapped_column(
+        SqlEnum(ChunkStatus, name="chunk_status", native_enum=False),
+        default=ChunkStatus.PENDING,
+        nullable=False,
+        index=True,
+    )
+    tg_message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
@@ -121,6 +174,10 @@ _COLUMN_MIGRATIONS: dict[str, dict[str, str]] = {
     "photos": {
         "media_type": "VARCHAR(5) NOT NULL DEFAULT 'IMAGE'",
         "failed_status": "VARCHAR(15)",
+        "is_chunked": "BOOLEAN NOT NULL DEFAULT 0",
+        "sha256": "VARCHAR(64)",
+        "total_size": "BIGINT",
+        "manifest_tg_message_id": "BIGINT",
     },
 }
 

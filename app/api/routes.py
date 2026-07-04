@@ -142,15 +142,29 @@ async def list_photos(
 
 def _resume_status(photo: Photo) -> PhotoStatus:
     if photo.failed_status is not None:
-        return photo.failed_status
-    # Legacy rows without failed_status: infer the resume point from what exists.
-    if photo.compressed_path:
-        return PhotoStatus.COMPRESSED
-    if photo.tg_message_id:
-        return PhotoStatus.TG_UPLOADED
-    if photo.local_path:
-        return PhotoStatus.DOWNLOADED
-    return PhotoStatus.PENDING
+        resume = photo.failed_status
+    elif photo.compressed_path:
+        # Legacy rows without failed_status: infer the resume point from what exists.
+        resume = PhotoStatus.COMPRESSED
+    elif photo.tg_message_id:
+        resume = PhotoStatus.TG_UPLOADED
+    elif photo.local_path:
+        resume = PhotoStatus.DOWNLOADED
+    else:
+        resume = PhotoStatus.PENDING
+
+    # Walk back when a step's prerequisite file no longer exists on disk.
+    if resume == PhotoStatus.COMPRESSED and not (
+        photo.compressed_path and Path(photo.compressed_path).is_file()
+    ):
+        resume = PhotoStatus.TG_UPLOADED
+    if resume in (
+        PhotoStatus.DOWNLOADED,
+        PhotoStatus.CHUNK_UPLOADING,
+        PhotoStatus.TG_UPLOADED,
+    ) and not (photo.local_path and Path(photo.local_path).is_file()):
+        resume = PhotoStatus.PENDING
+    return resume
 
 
 @router.post("/photos/{photo_id}/retry")

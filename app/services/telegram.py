@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import re
 from datetime import datetime
 from pathlib import Path
 
 from PIL import Image
 from pillow_heif import register_heif_opener
-from pyrogram import Client
+from pyrogram import Client, enums
 from pyrogram.types import Message
 
 register_heif_opener()
@@ -49,7 +50,9 @@ def _parse_filename_datetime(name: str) -> datetime | None:
     return None
 
 
-def _extract_datetime_sync(file_path: str | Path, fallback: datetime | None = None) -> datetime:
+def _extract_datetime_with_source_sync(
+    file_path: str | Path, fallback: datetime | None = None
+) -> tuple[datetime, str]:
     path = Path(file_path)
 
     try:
@@ -58,18 +61,32 @@ def _extract_datetime_sync(file_path: str | Path, fallback: datetime | None = No
             for tag in EXIF_DATETIME_TAGS:
                 parsed = _parse_exif_datetime(exif.get(tag))
                 if parsed is not None:
-                    return parsed
+                    return parsed, "exif"
     except Exception:
         pass
 
     from_name = _parse_filename_datetime(path.name)
     if from_name is not None:
-        return from_name
+        return from_name, "filename"
 
     if fallback is not None:
-        return fallback
+        return fallback, "fallback"
 
-    return datetime.fromtimestamp(path.stat().st_mtime)
+    return datetime.fromtimestamp(path.stat().st_mtime), "mtime"
+
+
+def _extract_datetime_sync(file_path: str | Path, fallback: datetime | None = None) -> datetime:
+    return _extract_datetime_with_source_sync(file_path, fallback)[0]
+
+
+async def extract_datetime_with_source(
+    file_path: str | Path, fallback: datetime | None = None
+) -> tuple[datetime, str]:
+    return await asyncio.to_thread(_extract_datetime_with_source_sync, file_path, fallback)
+
+
+def format_date_caption(photo_datetime: datetime) -> str:
+    return _format_caption(photo_datetime)
 
 
 def _format_caption(photo_datetime: datetime) -> str:
@@ -119,3 +136,42 @@ class TelegramService:
         if self.upload_delay_seconds > 0:
             await asyncio.sleep(self.upload_delay_seconds)
         return message
+
+    async def upload_file_object(self, file_object, caption: str) -> Message:
+        """Upload a binary file-like object (with .name) as a document."""
+        message = await self.client.send_document(
+            chat_id=self.channel_id,
+            document=file_object,
+            caption=caption,
+            file_name=file_object.name,
+        )
+
+        if self.upload_delay_seconds > 0:
+            await asyncio.sleep(self.upload_delay_seconds)
+        return message
+
+    async def upload_bytes(self, data: bytes, *, file_name: str, caption: str) -> Message:
+        buffer = io.BytesIO(data)
+        buffer.name = file_name
+        return await self.upload_file_object(buffer, caption)
+
+    async def find_document_by_name(self, file_name: str) -> Message | None:
+        """Best-effort channel search for a document with this exact filename.
+
+        Used to close the crash window between sending a chunk and committing
+        its message id: on retry, an already-uploaded chunk is reused instead of
+        duplicated. Any search failure is treated as not-found.
+        """
+        try:
+            async for message in self.client.search_messages(
+                self.channel_id,
+                query=file_name,
+                filter=enums.MessagesFilter.DOCUMENT,
+                limit=10,
+            ):
+                document = getattr(message, "document", None)
+                if document is not None and document.file_name == file_name:
+                    return message
+        except Exception:
+            return None
+        return None

@@ -112,6 +112,8 @@ async def lifespan(app: FastAPI):
             per_file_delay=float(os.getenv("WORKER_FILE_DELAY", "0")),
             max_retries=int(os.getenv("WORKER_MAX_RETRIES", "3")),
             batch_size=int(os.getenv("WORKER_BATCH_SIZE", "50")),
+            chunk_size=int(os.getenv("CHUNK_SIZE", "1900000000")),
+            chunk_threshold=int(os.getenv("CHUNK_THRESHOLD", "1950000000")),
         )
 
         recovery_kinds = tuple(
