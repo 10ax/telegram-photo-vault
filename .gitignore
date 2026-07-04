@@ -1,0 +1,7 @@
+.tokensave
+__pycache__/
+*.py[cod]
+.claude/
+data/
+mega-config/
+.env

@@ -4,6 +4,9 @@ import asyncio
 from pathlib import Path
 
 from PIL import Image, ImageOps
+from pillow_heif import register_heif_opener
+
+register_heif_opener()
 
 MAX_LONG_SIDE = 1920
 WEBP_QUALITY = 80

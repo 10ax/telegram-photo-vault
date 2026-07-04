@@ -9,8 +9,9 @@ from pathlib import Path, PurePosixPath
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
-from app.models.database import AsyncSessionLocal, Photo, PhotoStatus
+from app.models.database import AsyncSessionLocal, MediaType, Photo, PhotoStatus
 from app.services.image import compress_to_webp
+from app.services.media import detect_media_type
 from app.services.mega import MegaCmdError, MegaService
 from app.services.sftp import SFTPService
 from app.services.telegram import TelegramService
@@ -89,7 +90,7 @@ class PhotoWorker:
             if not new_paths:
                 return 0
 
-            session.add_all(Photo(mega_path=path, status=PhotoStatus.PENDING) for path in new_paths)
+            session.add_all(self._new_photo(path) for path in new_paths)
             inserted = len(new_paths)
 
             try:
@@ -98,7 +99,7 @@ class PhotoWorker:
                 await session.rollback()
                 inserted = 0
                 for path in new_paths:
-                    session.add(Photo(mega_path=path, status=PhotoStatus.PENDING))
+                    session.add(self._new_photo(path))
                     try:
                         await session.commit()
                         inserted += 1
@@ -106,8 +107,16 @@ class PhotoWorker:
                         await session.rollback()
 
         if inserted:
-            logger.info("Discovered %s new photo(s) from MEGA.", inserted)
+            logger.info("Discovered %s new file(s) from MEGA.", inserted)
         return inserted
+
+    @staticmethod
+    def _new_photo(mega_path: str) -> Photo:
+        media_type = detect_media_type(mega_path)
+        status = PhotoStatus.SKIPPED if media_type == MediaType.OTHER else PhotoStatus.PENDING
+        if status == PhotoStatus.SKIPPED:
+            logger.info("Skipping unsupported file type: %s", mega_path)
+        return Photo(mega_path=mega_path, status=status, media_type=media_type)
 
     async def _fetch_active_photo_ids(self) -> list[int]:
         async with AsyncSessionLocal() as session:
@@ -150,7 +159,11 @@ class PhotoWorker:
             return
 
         if photo.status == PhotoStatus.TG_UPLOADED:
-            await self._handle_tg_uploaded(photo)
+            if photo.media_type == MediaType.VIDEO:
+                # Videos are archived to Telegram only: no WebP/SFTP mirror.
+                await self._finalize(photo)
+            else:
+                await self._handle_tg_uploaded(photo)
             return
 
         if photo.status == PhotoStatus.COMPRESSED:
@@ -208,6 +221,9 @@ class PhotoWorker:
         photo.status = PhotoStatus.ODROID_UPLOADED
 
     async def _handle_odroid_uploaded(self, photo: Photo) -> None:
+        await self._finalize(photo)
+
+    async def _finalize(self, photo: Photo) -> None:
         try:
             await self.mega_service.delete_file(photo.mega_path)
         except MegaCmdError as exc:

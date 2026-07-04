@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 from contextlib import asynccontextmanager, suppress
 
 from fastapi import FastAPI
 from pyrogram import Client
+
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
 
 from app.api.routes import router as api_router
 from app.models.database import init_db
@@ -57,6 +63,8 @@ async def lifespan(app: FastAPI):
         "name": telegram_session_name,
         "api_id": telegram_api_id,
         "api_hash": telegram_api_hash,
+        # Auto-sleep on FloodWait errors shorter than this many seconds.
+        "sleep_threshold": int(os.getenv("TELEGRAM_SLEEP_THRESHOLD", "60")),
     }
     if telegram_session_string:
         pyrogram_kwargs["session_string"] = telegram_session_string

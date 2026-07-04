@@ -4,7 +4,7 @@ import os
 from datetime import datetime
 from enum import Enum
 
-from sqlalchemy import DateTime, Enum as SqlEnum, Integer, String, Text, func
+from sqlalchemy import BigInteger, DateTime, Enum as SqlEnum, Integer, String, Text, func
 from sqlalchemy.ext.asyncio import AsyncAttrs, AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -26,6 +26,13 @@ class PhotoStatus(str, Enum):
     ODROID_UPLOADED = "ODROID_UPLOADED"
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
+    SKIPPED = "SKIPPED"
+
+
+class MediaType(str, Enum):
+    IMAGE = "IMAGE"
+    VIDEO = "VIDEO"
+    OTHER = "OTHER"
 
 
 class Photo(Base):
@@ -41,7 +48,12 @@ class Photo(Base):
         nullable=False,
         index=True,
     )
-    tg_message_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    media_type: Mapped[MediaType] = mapped_column(
+        SqlEnum(MediaType, name="media_type", native_enum=False),
+        default=MediaType.IMAGE,
+        nullable=False,
+    )
+    tg_message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     retry_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     error_log: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
@@ -55,6 +67,27 @@ class Photo(Base):
     )
 
 
+# Additive column migrations for databases created by older versions of the schema.
+# SQLite's create_all only creates missing tables, never missing columns.
+_COLUMN_MIGRATIONS: dict[str, dict[str, str]] = {
+    "photos": {
+        "media_type": "VARCHAR(5) NOT NULL DEFAULT 'IMAGE'",
+    },
+}
+
+
+async def _apply_column_migrations(conn) -> None:
+    for table, columns in _COLUMN_MIGRATIONS.items():
+        result = await conn.exec_driver_sql(f"PRAGMA table_info({table})")
+        existing = {row[1] for row in result.fetchall()}
+        if not existing:
+            continue
+        for column, ddl in columns.items():
+            if column not in existing:
+                await conn.exec_driver_sql(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+
+
 async def init_db() -> None:
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        await _apply_column_migrations(conn)
