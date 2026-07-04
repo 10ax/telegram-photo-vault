@@ -35,6 +35,11 @@ services:
       ODROID_KNOWN_HOSTS: ${ODROID_KNOWN_HOSTS}
       ODROID_ALLOW_INSECURE_HOST_KEY: ${ODROID_ALLOW_INSECURE_HOST_KEY:-false}
       ODROID_REMOTE_DIR: ${ODROID_REMOTE_DIR:-/srv/photo-vault}
+      RECOVERY_DOWNLOAD_ROOT: /data/recovery
+      RECOVERY_DELAY: ${RECOVERY_DELAY:-5}
+      RECOVERY_MAX_RETRIES: ${RECOVERY_MAX_RETRIES:-3}
+      RECOVERY_KINDS: ${RECOVERY_KINDS:-photo,video,document,animation}
+      RECOVERY_DELETE_OLD: ${RECOVERY_DELETE_OLD:-true}
     volumes:
       - ./data:/data
       - ./mega-config:/root/.megaCmd

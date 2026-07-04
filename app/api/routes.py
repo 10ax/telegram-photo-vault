@@ -6,9 +6,11 @@ import shutil
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
+from pydantic import BaseModel
 from sqlalchemy import func, select
 
-from app.models.database import AsyncSessionLocal, Photo, PhotoStatus
+from app.models.database import AsyncSessionLocal, Photo, PhotoStatus, RecoveryItem, RecoveryStatus
+from app.services.recovery import RecoveryBusyError
 
 ERROR_LOG_PREVIEW_CHARS = 4000
 
@@ -35,6 +37,22 @@ def _get_worker(request: Request):
     return getattr(request.app.state, "worker", None)
 
 
+def _get_recovery(request: Request):
+    return getattr(request.app.state, "recovery", None)
+
+
+async def _recovery_counts() -> dict[str, int]:
+    counts: dict[str, int] = {recovery_status.value: 0 for recovery_status in RecoveryStatus}
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(
+            select(RecoveryItem.status, func.count(RecoveryItem.id)).group_by(RecoveryItem.status)
+        )
+        for item_status, count in result.all():
+            key = item_status.value if isinstance(item_status, RecoveryStatus) else str(item_status)
+            counts[key] = int(count)
+    return counts
+
+
 @router.get("/status")
 async def get_status(request: Request) -> dict[str, object]:
     status_counts: dict[str, int] = {photo_status.value: 0 for photo_status in PhotoStatus}
@@ -49,9 +67,17 @@ async def get_status(request: Request) -> dict[str, object]:
             status_counts[key] = int(count)
 
     worker = _get_worker(request)
+    recovery = _get_recovery(request)
+
+    recovery_block = None
+    if recovery is not None:
+        recovery_block = recovery.status_snapshot()
+        recovery_block["items"] = await _recovery_counts()
+
     return {
         "photos": status_counts,
         "worker": worker.status_snapshot() if worker is not None else None,
+        "recovery": recovery_block,
     }
 
 
@@ -154,6 +180,85 @@ async def retry_photo(photo_id: int, request: Request) -> dict[str, object]:
         worker.trigger()
 
     return payload
+
+
+class RecoveryRunRequest(BaseModel):
+    dry_run: bool = True
+
+
+def _require_recovery(request: Request):
+    recovery = _get_recovery(request)
+    if recovery is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Recovery service is not available.",
+        )
+    return recovery
+
+
+@router.post("/recovery/scan")
+async def recovery_scan(request: Request) -> dict[str, object]:
+    recovery = _require_recovery(request)
+    try:
+        recovery.start_scan()
+    except RecoveryBusyError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+    return recovery.status_snapshot()
+
+
+@router.post("/recovery/run")
+async def recovery_run(request: Request, payload: RecoveryRunRequest | None = None) -> dict[str, object]:
+    recovery = _require_recovery(request)
+    dry_run = payload.dry_run if payload is not None else True
+    try:
+        recovery.start_run(dry_run)
+    except RecoveryBusyError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+    return recovery.status_snapshot()
+
+
+@router.get("/recovery/items")
+async def recovery_items(
+    status_filter: str | None = Query(default=None, alias="status"),
+    limit: int = Query(default=50, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+) -> dict[str, object]:
+    query = select(RecoveryItem)
+    count_query = select(func.count(RecoveryItem.id))
+
+    if status_filter is not None:
+        try:
+            wanted = RecoveryStatus(status_filter)
+        except ValueError:
+            raise HTTPException(status_code=422, detail=f"Unknown status: {status_filter}")
+        query = query.where(RecoveryItem.status == wanted)
+        count_query = count_query.where(RecoveryItem.status == wanted)
+
+    async with AsyncSessionLocal() as session:
+        total = (await session.execute(count_query)).scalar_one()
+        result = await session.scalars(
+            query.order_by(RecoveryItem.id.desc()).limit(limit).offset(offset)
+        )
+        items = [
+            {
+                "id": item.id,
+                "tg_message_id": item.tg_message_id,
+                "media_kind": item.media_kind,
+                "file_name": item.file_name,
+                "file_size": item.file_size,
+                "message_date": item.message_date.isoformat() if item.message_date else None,
+                "status": item.status.value,
+                "sha256": item.sha256,
+                "planned_caption": item.planned_caption,
+                "new_tg_message_id": item.new_tg_message_id,
+                "retry_count": item.retry_count,
+                "error_log": (item.error_log or None)
+                and item.error_log[-ERROR_LOG_PREVIEW_CHARS:],
+            }
+            for item in result
+        ]
+
+    return {"total": int(total), "limit": limit, "offset": offset, "items": items}
 
 
 @router.get("/system")

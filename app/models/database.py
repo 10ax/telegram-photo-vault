@@ -35,6 +35,17 @@ class MediaType(str, Enum):
     OTHER = "OTHER"
 
 
+class RecoveryStatus(str, Enum):
+    SCANNED = "SCANNED"
+    DOWNLOADED = "DOWNLOADED"
+    PLANNED = "PLANNED"
+    REUPLOADED = "REUPLOADED"
+    COMPLETED = "COMPLETED"
+    SKIPPED = "SKIPPED"
+    DUPLICATE = "DUPLICATE"
+    FAILED = "FAILED"
+
+
 class Photo(Base):
     __tablename__ = "photos"
 
@@ -59,6 +70,38 @@ class Photo(Base):
         nullable=True,
     )
     tg_message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    retry_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    error_log: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+
+class RecoveryItem(Base):
+    __tablename__ = "recovery_items"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    tg_message_id: Mapped[int] = mapped_column(BigInteger, unique=True, nullable=False, index=True)
+    media_kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    file_name: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    file_size: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    message_date: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    status: Mapped[RecoveryStatus] = mapped_column(
+        SqlEnum(RecoveryStatus, name="recovery_status", native_enum=False),
+        default=RecoveryStatus.SCANNED,
+        nullable=False,
+        index=True,
+    )
+    local_path: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    sha256: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    planned_caption: Mapped[str | None] = mapped_column(Text, nullable=True)
+    new_tg_message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     retry_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     error_log: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(

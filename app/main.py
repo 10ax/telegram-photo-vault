@@ -18,6 +18,7 @@ logging.basicConfig(
 from app.api.routes import router as api_router
 from app.models.database import init_db
 from app.services.mega import MegaService
+from app.services.recovery import MEDIA_KINDS, RecoveryService
 from app.services.sftp import SFTPService
 from app.services.telegram import TelegramService
 from app.worker import PhotoWorker
@@ -113,13 +114,32 @@ async def lifespan(app: FastAPI):
             batch_size=int(os.getenv("WORKER_BATCH_SIZE", "50")),
         )
 
+        recovery_kinds = tuple(
+            kind.strip()
+            for kind in os.getenv("RECOVERY_KINDS", ",".join(MEDIA_KINDS)).split(",")
+            if kind.strip()
+        )
+        recovery = RecoveryService(
+            telegram_service,
+            download_root=os.getenv("RECOVERY_DOWNLOAD_ROOT", "/data/recovery"),
+            delay_seconds=float(os.getenv("RECOVERY_DELAY", "5")),
+            max_retries=int(os.getenv("RECOVERY_MAX_RETRIES", "3")),
+            kinds=recovery_kinds,
+            delete_old=_parse_bool(os.getenv("RECOVERY_DELETE_OLD"), default=True),
+        )
+
         worker_task = asyncio.create_task(worker.run_forever(), name="photo-worker")
         app.state.worker = worker
         app.state.worker_task = worker_task
+        app.state.recovery = recovery
         app.state.telegram_client = telegram_client
 
         yield
     finally:
+        recovery_service = getattr(app.state, "recovery", None)
+        if recovery_service is not None:
+            await recovery_service.shutdown()
+
         if worker_task is not None:
             worker_task.cancel()
             with suppress(asyncio.CancelledError):
