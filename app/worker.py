@@ -297,6 +297,11 @@ class PhotoWorker:
 
         message = await self.telegram_service.upload_document(local_path)
         photo.tg_message_id = message.id
+
+        media_message = await self.telegram_service.upload_media(local_path, photo.media_type)
+        if media_message is not None:
+            photo.tg_media_message_id = media_message.id
+
         photo.status = PhotoStatus.TG_UPLOADED
 
     async def _prepare_chunks(

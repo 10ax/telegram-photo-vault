@@ -155,6 +155,43 @@ class TelegramService:
         buffer.name = file_name
         return await self.upload_file_object(buffer, caption)
 
+    async def upload_media(
+        self,
+        file_path: str | Path,
+        media_type,
+        *,
+        caption: str | None = None,
+        caption_fallback: datetime | None = None,
+    ) -> Message | None:
+        """Upload file as native media (photo or video). Returns None for unsupported types."""
+        from app.models.database import MediaType
+
+        path = Path(file_path)
+        if caption is None:
+            caption = await build_caption(path, fallback=caption_fallback)
+
+        try:
+            if media_type == MediaType.IMAGE:
+                message = await self.client.send_photo(
+                    chat_id=self.channel_id,
+                    photo=str(path),
+                    caption=caption,
+                )
+            elif media_type == MediaType.VIDEO:
+                message = await self.client.send_video(
+                    chat_id=self.channel_id,
+                    video=str(path),
+                    caption=caption,
+                )
+            else:
+                return None
+        except Exception:
+            return None
+
+        if self.upload_delay_seconds > 0:
+            await asyncio.sleep(self.upload_delay_seconds)
+        return message
+
     async def find_document_by_name(self, file_name: str) -> Message | None:
         """Best-effort channel search for a document with this exact filename.
 

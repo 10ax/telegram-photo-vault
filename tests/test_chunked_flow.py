@@ -49,6 +49,10 @@ class FakeTelegram:
     async def find_document_by_name(self, file_name):
         return self.search_hits.get(file_name)
 
+    async def upload_media(self, file_path, media_type, **kwargs):
+        self.next_id += 1
+        return SimpleNamespace(id=self.next_id)
+
 
 class FakeMega:
     def __init__(self):

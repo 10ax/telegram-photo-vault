@@ -82,6 +82,7 @@ class Photo(Base):
         nullable=True,
     )
     tg_message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    tg_media_message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     is_chunked: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
     total_size: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
@@ -178,6 +179,7 @@ _COLUMN_MIGRATIONS: dict[str, dict[str, str]] = {
         "sha256": "VARCHAR(64)",
         "total_size": "BIGINT",
         "manifest_tg_message_id": "BIGINT",
+        "tg_media_message_id": "BIGINT",
     },
 }
 
