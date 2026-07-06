@@ -227,7 +227,9 @@ function renderWorker(worker) {
     ? `every ${Math.round(worker.run_interval_seconds / 60)} min`
     : "manual (on demand only)";
   $("w-last").textContent = fmtTime(worker.last_run_finished_at || worker.last_run_started_at);
-  $("w-next").textContent = worker.running ? "now" : fmtTime(worker.next_run_at);
+  $("w-next").textContent = worker.running
+    ? `running (since ${fmtTime(worker.last_run_started_at)})`
+    : fmtTime(worker.next_run_at);
   $("w-error").innerHTML = worker.last_run_error
     ? `<details><summary>Last run failed</summary><pre>${escapeHtml(worker.last_run_error)}</pre></details>`
     : "";
