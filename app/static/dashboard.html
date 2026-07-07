@@ -105,6 +105,7 @@
   }
   #toast.show { opacity: 1; }
   .wide { grid-column: 1 / -1; margin-top: 12px; }
+  .tiles-caption { color: var(--muted); font-size: 12px; margin: 0 0 8px; }
 </style>
 </head>
 <body>
@@ -117,6 +118,7 @@
     </div>
   </header>
 
+  <div class="tiles-caption" id="tiles-caption"></div>
   <div class="grid" id="tiles"></div>
 
   <div class="cards">
@@ -208,12 +210,21 @@ function fmtTime(iso) {
   return `${then.toLocaleTimeString()} (${deltaSeconds <= 0 ? rel + " ago" : "in " + rel})`;
 }
 
+// Intermediate pipeline stages hold items only while in flight; they drain as
+// items advance, so their counts are a live snapshot, not a running total.
+const IN_PROGRESS = new Set(["DOWNLOADED", "CHUNK_UPLOADING", "TG_UPLOADED",
+                             "COMPRESSED", "ODROID_UPLOADED"]);
+
 function renderTiles(counts) {
   const keys = [...STATUS_ORDER.filter(k => k in counts),
                 ...Object.keys(counts).filter(k => !STATUS_ORDER.includes(k))];
+  const total = Object.values(counts).reduce((sum, n) => sum + (Number(n) || 0), 0);
+  $("tiles-caption").textContent =
+    `Live count of files currently in each stage (not a running total). ` +
+    `In-progress stages drain as files advance to Completed. Total tracked: ${total}.`;
   $("tiles").innerHTML = keys.map(key => `
     <div class="tile">
-      <div class="label"><span class="dot" style="background:${STATUS_DOTS[key] || "var(--accent)"}"></span>${key.replaceAll("_", " ")}</div>
+      <div class="label"><span class="dot" style="background:${STATUS_DOTS[key] || "var(--accent)"}"></span>${key.replaceAll("_", " ")}${IN_PROGRESS.has(key) ? " (in progress)" : ""}</div>
       <div class="value">${counts[key]}</div>
     </div>`).join("");
 }
