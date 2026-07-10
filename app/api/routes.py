@@ -198,6 +198,9 @@ async def retry_photo(photo_id: int, request: Request) -> dict[str, object]:
 
 class RecoveryRunRequest(BaseModel):
     dry_run: bool = True
+    # Optional per-request overrides; fall back to the service's configured batch.
+    limit: int | None = None
+    max_download_bytes: int | None = None
 
 
 def _require_recovery(request: Request):
@@ -224,8 +227,10 @@ async def recovery_scan(request: Request) -> dict[str, object]:
 async def recovery_run(request: Request, payload: RecoveryRunRequest | None = None) -> dict[str, object]:
     recovery = _require_recovery(request)
     dry_run = payload.dry_run if payload is not None else True
+    limit = payload.limit if payload is not None else None
+    max_download_bytes = payload.max_download_bytes if payload is not None else None
     try:
-        recovery.start_run(dry_run)
+        recovery.start_run(dry_run, limit=limit, max_download_bytes=max_download_bytes)
     except RecoveryBusyError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
     return recovery.status_snapshot()

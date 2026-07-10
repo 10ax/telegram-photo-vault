@@ -146,7 +146,7 @@
       <div class="actions">
         <button id="r-scan">Scan channel</button>
         <button id="r-dry">Dry run</button>
-        <button class="danger" id="r-run">Tidy (re-upload + delete)</button>
+        <button id="r-run">Tidy batch (caption in place)</button>
       </div>
     </section>
   </div>
@@ -269,8 +269,27 @@ function renderRecovery(recovery) {
   const counts = recovery.items || {};
   const stats = Object.entries(counts).filter(([, count]) => count > 0)
     .map(([key, count]) => `<dt>${key.toLowerCase()}</dt><dd>${count}</dd>`).join("");
+
+  let batchLine = "";
+  const b = recovery.batch;
+  if (b) {
+    const label = recovery.running ? "batch" : "last batch";
+    batchLine = `<dt>${label}</dt><dd>${b.processed}/${b.total}` +
+      ` · captioned ${b.captioned} · already ${b.already} · deferred ${b.deferred}` +
+      ` · failed ${b.failed}</dd>`;
+  }
+
+  let diskLine = "";
+  const d = recovery.disk;
+  if (d && d.free_bytes != null) {
+    const gb = x => (x / 1073741824).toFixed(1) + " GB";
+    const warn = d.below_floor ? " ⚠ below floor — downloads paused" : "";
+    diskLine = `<dt>disk</dt><dd>${gb(d.free_bytes)} free (floor ${gb(d.min_free_bytes)})${warn}</dd>`;
+  }
+
   $("r-stats").innerHTML =
-    `<dt>State</dt><dd>${recovery.running ? (recovery.activity || "running") : "idle"}</dd>` + stats +
+    `<dt>State</dt><dd>${recovery.running ? (recovery.activity || "running") : "idle"}</dd>` +
+    batchLine + stats + diskLine +
     (recovery.last_error ? `<dt>error</dt><dd>${escapeHtml(recovery.last_error).slice(0, 300)}</dd>` : "");
 }
 
@@ -336,7 +355,7 @@ $("run-now").addEventListener("click", () => post("/api/run"));
 $("r-scan").addEventListener("click", () => post("/api/recovery/scan"));
 $("r-dry").addEventListener("click", () => post("/api/recovery/run", { dry_run: true }));
 $("r-run").addEventListener("click", () => post("/api/recovery/run", { dry_run: false },
-  "Re-upload tidied copies AND DELETE the original channel messages. Continue?"));
+  "Tidy one batch: add date captions to existing messages in place (no downloads for most, nothing deleted). Continue?"));
 $("failed-rows").addEventListener("click", (event) => {
   const id = event.target.dataset && event.target.dataset.retry;
   if (id) post(`/api/photos/${id}/retry`);

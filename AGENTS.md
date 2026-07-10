@@ -9,8 +9,11 @@ This repository implements an async pipeline:
 5. Upload WebP to Odroid via SFTP (videos skip this)
 6. Delete remote source from MEGA and local temp files
 
-Plus a **channel recovery** subsystem that scans existing channel history and
-re-uploads media as tidy captioned documents (see `PLAN.md` and
+Plus a **channel recovery / tidy** subsystem that scans existing channel
+history and adds date-hashtag captions to media. It works *in place* (edits the
+caption, keeps the media) using the filename or post date, and only downloads
+image documents whose filename lacks a date so their EXIF can be read. Work runs
+in bounded, resumable batches guarded by a free-space floor (see `PLAN.md` and
 `docs/video-chunking-design.md`).
 
 Core stack: FastAPI, SQLAlchemy 2.x async, SQLite, kurigram (maintained
@@ -35,9 +38,14 @@ Pyrogram fork, same `pyrogram` namespace), Pillow (+pillow-heif), asyncssh.
   `SKIPPED` for unsupported types. Videos jump `TG_UPLOADED → finalize`.
   Files larger than `CHUNK_THRESHOLD` go through `CHUNK_UPLOADING` (one chunk
   per worker visit; JSON manifest uploaded last as the commit marker).
-- RecoveryItem: `SCANNED → DOWNLOADED → PLANNED (dry-run) → REUPLOADED →
-  COMPLETED`; `SKIPPED` (already tidy / message gone), `DUPLICATE` (same
-  SHA-256, never deleted), `FAILED`.
+- RecoveryItem (hybrid in-place tidy): `SCANNED → [PLANNED (dry-run)] →
+  COMPLETED`. A run derives the date caption from the filename → post date (no
+  download), or downloads an image document to read EXIF only when its filename
+  has no date (disk-guarded), then edits the caption in place (existing free-text
+  is preserved). `SKIPPED` (already tidy / message gone / no date derivable),
+  `FAILED`. Items are deferred (left `SCANNED`) when a download would breach the
+  free-space floor. `DOWNLOADED`/`REUPLOADED`/`DUPLICATE` are legacy states no
+  longer produced by the in-place flow.
 
 ## API
 - `GET /` dashboard (static, no key; calls the API with a stored key)
@@ -45,8 +53,9 @@ Pyrogram fork, same `pyrogram` namespace), Pillow (+pillow-heif), asyncssh.
 - `GET /api/status` — photo counts + worker state + recovery state
 - `POST /api/run` — trigger a worker run now
 - `GET /api/photos?status=&limit=&offset=` / `POST /api/photos/{id}/retry`
-- `POST /api/recovery/scan`, `POST /api/recovery/run` (`{"dry_run": true|false}`,
-  default true), `GET /api/recovery/items?status=`
+- `POST /api/recovery/scan`, `POST /api/recovery/run`
+  (`{"dry_run": true|false, "limit"?, "max_download_bytes"?}`, dry_run default
+  true; each call processes one batch), `GET /api/recovery/items?status=`
 - `GET /api/system` — disk usage
 
 ## Required Environment Variables
@@ -75,11 +84,18 @@ Pyrogram fork, same `pyrogram` namespace), Pillow (+pillow-heif), asyncssh.
   `WORKER_COMPRESSED_ROOT` (default: `/data/compressed`)
 - `CHUNK_SIZE` (default: `1900000000`), `CHUNK_THRESHOLD` (default: `1950000000`;
   raise both only on a Premium account — standard accounts cap at 2 GB)
-- `RECOVERY_DOWNLOAD_ROOT` (default: `/data/recovery`)
-- `RECOVERY_DELAY` (default: `5`), `RECOVERY_MAX_RETRIES` (default: `3`)
+- `RECOVERY_DOWNLOAD_ROOT` (default: `/data/recovery`; scratch for EXIF-only
+  downloads, cleaned per item)
+- `RECOVERY_DELAY` (default: `5`; seconds between items in a batch),
+  `RECOVERY_MAX_RETRIES` (default: `3`)
 - `RECOVERY_KINDS` (default: `photo,video,document,animation`)
-- `RECOVERY_DELETE_OLD` (default: `true`; originals deleted only after the
-  tidy replacement is confirmed)
+- `RECOVERY_BATCH_SIZE` (default: `300`; items processed per run)
+- `RECOVERY_MIN_FREE_GB` (default: `10`; free-space floor — an item is deferred
+  rather than downloaded if fetching it would drop below this)
+- `RECOVERY_BATCH_MAX_DOWNLOAD_GB` (default: `5`; a batch stops early once it has
+  downloaded this many GB of EXIF-only files)
+- `RECOVERY_DELETE_OLD` (default: `true`; legacy — the in-place tidy never
+  deletes originals, so this is currently informational only)
 
 ## Local Run
 1. `pip install -r requirements.txt`

@@ -9,6 +9,7 @@ from pathlib import Path
 from PIL import Image
 from pillow_heif import register_heif_opener
 from pyrogram import Client, enums
+from pyrogram.errors import MessageNotModified
 from pyrogram.types import Message
 
 register_heif_opener()
@@ -191,6 +192,23 @@ class TelegramService:
         if self.upload_delay_seconds > 0:
             await asyncio.sleep(self.upload_delay_seconds)
         return message
+
+    async def edit_caption(self, message_id: int, caption: str) -> bool:
+        """Set an existing message's caption in place, keeping the media untouched.
+
+        This is the cheap "tidy" path: no download, no re-upload, no delete —
+        just the caption. Returns True when the caption is applied (or already
+        identical). Pacing is left to the caller so batch runs control throughput.
+        """
+        try:
+            await self.client.edit_message_caption(
+                chat_id=self.channel_id,
+                message_id=message_id,
+                caption=caption,
+            )
+        except MessageNotModified:
+            pass
+        return True
 
     async def find_document_by_name(self, file_name: str) -> Message | None:
         """Best-effort channel search for a document with this exact filename.

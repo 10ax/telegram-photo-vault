@@ -42,6 +42,9 @@ services:
       RECOVERY_MAX_RETRIES: ${RECOVERY_MAX_RETRIES:-3}
       RECOVERY_KINDS: ${RECOVERY_KINDS:-photo,video,document,animation}
       RECOVERY_DELETE_OLD: ${RECOVERY_DELETE_OLD:-true}
+      RECOVERY_BATCH_SIZE: ${RECOVERY_BATCH_SIZE:-300}
+      RECOVERY_MIN_FREE_GB: ${RECOVERY_MIN_FREE_GB:-10}
+      RECOVERY_BATCH_MAX_DOWNLOAD_GB: ${RECOVERY_BATCH_MAX_DOWNLOAD_GB:-5}
     volumes:
       - ./data:/data
       - ./mega-config:/root/.megaCmd

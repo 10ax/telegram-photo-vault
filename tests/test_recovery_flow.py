@@ -1,4 +1,4 @@
-"""Functional test of the channel recovery flow against a fake Pyrogram client."""
+"""Functional test of the hybrid in-place tidy flow against a fake Pyrogram client."""
 import io
 from datetime import datetime
 from pathlib import Path
@@ -34,50 +34,68 @@ def _msg(mid, *, photo=None, document=None, caption=None, date=None):
 
 class FakeClient:
     def __init__(self, messages, content):
-        self.messages = messages
+        self.messages = {m.id: m for m in messages}
         self.content = content
-        self.sent = []
+        self.edited = []
         self.deleted = []
+        self.downloaded = []
 
     async def get_chat_history(self, chat_id):
-        for message in self.messages:
+        for message in self.messages.values():
             yield message
 
     async def get_messages(self, chat_id, message_id):
-        return next((m for m in self.messages if m.id == message_id), None)
+        return self.messages.get(message_id)
 
     async def download_media(self, message, file_name):
+        self.downloaded.append(message.id)
         Path(file_name).parent.mkdir(parents=True, exist_ok=True)
         Path(file_name).write_bytes(self.content[message.id])
         return file_name
 
-    async def send_document(self, chat_id, document, caption=None, file_name=None):
-        self.sent.append({"caption": caption, "file_name": file_name})
-        return SimpleNamespace(id=1000 + len(self.sent))
+    async def edit_message_caption(self, chat_id, message_id, caption):
+        self.edited.append({"message_id": message_id, "caption": caption})
+        # Reflect the edit so a re-run sees the message as already tidy.
+        self.messages[message_id].caption = caption
+        return self.messages[message_id]
 
     async def delete_messages(self, chat_id, message_ids):
         self.deleted.append(message_ids)
 
 
-@pytest.fixture
-def env(clean_db, tmp_path):
-    messages = [
+def _messages():
+    return [
+        # photo, no filename, no caption -> caption from post date, no download
         _msg(101, photo=SimpleNamespace(file_size=999), date=datetime(2021, 7, 9, 8, 30)),
+        # document already tidy -> SKIPPED at scan
         _msg(
             102,
             document=SimpleNamespace(file_name="IMG_1.jpg", file_size=10),
             caption="#2020 #01_2020 #2020_01_02",
         ),
+        # document with date in filename -> caption from filename, no download
         _msg(103, document=SimpleNamespace(file_name="IMG_20240612_193000.jpg", file_size=10)),
+        # vault artifact -> ignored at scan
         _msg(104, document=SimpleNamespace(file_name="big.mp4.part001-of-002", file_size=10)),
+        # text-only message -> ignored at scan
         _msg(105),
-        _msg(106, document=SimpleNamespace(file_name="IMG_copy.jpg", file_size=10)),
+        # image document, no date in filename -> EXIF download path (falls back to post date)
+        _msg(106, document=SimpleNamespace(file_name="IMG_copy.jpg", file_size=1234)),
+        # document with a date filename AND existing free-text -> caption preserved
+        _msg(
+            107,
+            document=SimpleNamespace(file_name="PXL_20230101_120000.jpg", file_size=10),
+            caption="Holiday",
+        ),
     ]
-    content = {101: _jpeg((200, 10, 10)), 103: _jpeg((10, 200, 10)), 106: _jpeg((10, 200, 10))}
-    client = FakeClient(messages, content)
+
+
+@pytest.fixture
+def env(clean_db, tmp_path):
+    client = FakeClient(_messages(), content={106: _jpeg((10, 200, 10))})
     telegram = TelegramService(client, -100123, upload_delay_seconds=0)
     recovery = RecoveryService(
-        telegram, download_root=tmp_path / "recovery", delay_seconds=0, delete_old=True
+        telegram, download_root=tmp_path / "recovery", delay_seconds=0
     )
     return client, recovery
 
@@ -90,50 +108,91 @@ async def _items():
         return {row.tg_message_id: row for row in rows}
 
 
-async def test_full_recovery_flow(env):
+async def test_full_tidy_flow(env):
     client, recovery = env
 
-    # Scan: media ingested, tidy doc skipped, vault artifacts + text ignored.
+    # Scan: media ingested, already-tidy skipped, vault artifacts + text ignored.
     recovery.start_scan()
     await recovery._task
     assert recovery.last_error is None
     items = await _items()
-    assert set(items) == {101, 102, 103, 106}
+    assert set(items) == {101, 102, 103, 106, 107}
     assert items[102].status == RecoveryStatus.SKIPPED
     assert items[101].status == RecoveryStatus.SCANNED
 
     # Rescan is idempotent.
     recovery.start_scan()
     await recovery._task
-    assert len(await _items()) == 4
+    assert len(await _items()) == 5
 
-    # Dry run: plans captions, flags the duplicate, touches nothing on Telegram.
+    # Dry run: plans captions (downloads only the EXIF-only item), no edits.
     recovery.start_run(dry_run=True)
     await recovery._task
     assert recovery.last_error is None
     items = await _items()
     assert items[101].status == RecoveryStatus.PLANNED
-    assert items[103].status == RecoveryStatus.PLANNED
-    assert items[106].status == RecoveryStatus.DUPLICATE
     assert items[101].planned_caption == "#2021 #07_2021 #2021_07_09"
     assert items[103].planned_caption == "#2024 #06_2024 #2024_06_12"
-    assert client.sent == [] and client.deleted == []
-    assert Path(items[101].local_path).is_file()
+    assert items[106].planned_caption == "#2022 #03_2022 #2022_03_05"  # post-date fallback
+    assert items[107].planned_caption == "#2023 #01_2023 #2023_01_01"
+    assert client.downloaded == [106]  # only the filename-dateless image doc
+    assert client.edited == [] and client.deleted == []
 
-    # Real run: re-uploads tidy documents, deletes originals, cleans up.
+    # Real run: edits captions in place, never deletes, preserves free-text.
     recovery.start_run(dry_run=False)
     await recovery._task
     assert recovery.last_error is None
     items = await _items()
+    assert all(items[i].status == RecoveryStatus.COMPLETED for i in (101, 103, 106, 107))
+    assert client.deleted == []
+    edited = {e["message_id"]: e["caption"] for e in client.edited}
+    assert edited[101] == "#2021 #07_2021 #2021_07_09"
+    assert edited[103] == "#2024 #06_2024 #2024_06_12"
+    assert edited[107] == "Holiday\n\n#2023 #01_2023 #2023_01_01"  # original text kept
+    # Planned items already had their caption, so the real run did not re-download.
+    assert client.downloaded == [106]
+
+
+async def test_free_space_floor_defers_downloads(clean_db, tmp_path):
+    client = FakeClient(_messages(), content={106: _jpeg((10, 200, 10))})
+    telegram = TelegramService(client, -100123, upload_delay_seconds=0)
+    # An impossibly high floor: any download would breach it.
+    recovery = RecoveryService(
+        telegram,
+        download_root=tmp_path / "recovery",
+        delay_seconds=0,
+        min_free_bytes=10**18,
+    )
+
+    recovery.start_scan()
+    await recovery._task
+    recovery.start_run(dry_run=False)
+    await recovery._task
+
+    items = await _items()
+    # In-place items are still tidied; the EXIF download is deferred (stays SCANNED).
     assert items[101].status == RecoveryStatus.COMPLETED
     assert items[103].status == RecoveryStatus.COMPLETED
-    assert client.deleted == [101, 103]
-    assert len(client.sent) == 2
-    names = [entry["file_name"] for entry in client.sent]
-    assert names[0].startswith("photo_20210709")
-    assert names[1] == "IMG_20240612_193000.jpg"
-    assert items[101].new_tg_message_id is not None
-    assert items[101].local_path is None
+    assert items[106].status == RecoveryStatus.SCANNED
+    assert client.downloaded == []
+    assert recovery._last_batch["deferred"] == 1
+
+
+async def test_batch_size_limits_work_per_run(clean_db, tmp_path):
+    client = FakeClient(_messages(), content={106: _jpeg((10, 200, 10))})
+    telegram = TelegramService(client, -100123, upload_delay_seconds=0)
+    recovery = RecoveryService(
+        telegram, download_root=tmp_path / "recovery", delay_seconds=0, batch_size=2
+    )
+
+    recovery.start_scan()
+    await recovery._task
+    recovery.start_run(dry_run=False)
+    await recovery._task
+
+    completed = sum(1 for it in (await _items()).values() if it.status == RecoveryStatus.COMPLETED)
+    assert completed == 2  # only one batch of two items processed
+    assert recovery._last_batch["total"] == 2
 
 
 async def test_busy_guard(env):

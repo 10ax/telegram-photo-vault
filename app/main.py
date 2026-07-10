@@ -128,6 +128,11 @@ async def lifespan(app: FastAPI):
             max_retries=int(os.getenv("RECOVERY_MAX_RETRIES", "3")),
             kinds=recovery_kinds,
             delete_old=_parse_bool(os.getenv("RECOVERY_DELETE_OLD"), default=True),
+            batch_size=int(os.getenv("RECOVERY_BATCH_SIZE", "300")),
+            min_free_bytes=int(float(os.getenv("RECOVERY_MIN_FREE_GB", "10")) * 1024**3),
+            batch_max_download_bytes=int(
+                float(os.getenv("RECOVERY_BATCH_MAX_DOWNLOAD_GB", "5")) * 1024**3
+            ),
         )
 
         worker_task = asyncio.create_task(worker.run_forever(), name="photo-worker")

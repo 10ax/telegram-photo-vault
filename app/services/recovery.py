@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import logging
 import os
 import re
+import shutil
 import traceback
 from pathlib import Path
 
@@ -13,7 +13,12 @@ from pyrogram.types import Message
 from sqlalchemy import select
 
 from app.models.database import AsyncSessionLocal, RecoveryItem, RecoveryStatus
-from app.services.telegram import TelegramService, build_caption
+from app.services.telegram import (
+    TelegramService,
+    _parse_filename_datetime,
+    build_caption,
+    format_date_caption,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -23,21 +28,55 @@ MEDIA_KINDS = ("photo", "video", "document", "animation")
 CHUNK_PART_RE = re.compile(r"\.part\d+-of-\d+$")
 MANIFEST_SUFFIX = ".manifest.json"
 
-# A message is already tidy when it is a document whose caption carries the
-# full hashtag scheme (#YYYY #MM_YYYY #YYYY_MM_DD).
+# A message is already tidy when its caption carries the full hashtag scheme
+# (#YYYY #MM_YYYY #YYYY_MM_DD) — regardless of media type.
 TIDY_CAPTION_RE = re.compile(r"#\d{4}\s+#\d{2}_\d{4}\s+#\d{4}_\d{2}_\d{2}")
 
+# Only image *documents* keep usable EXIF: Telegram strips it from `photo`
+# messages, and the datetime extractor cannot read video/animation metadata.
+IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".heic", ".heif", ".tif", ".tiff", ".webp", ".bmp", ".gif"}
 
-def _sha256_file(path: str | Path) -> str:
-    digest = hashlib.sha256()
-    with open(path, "rb") as handle:
-        for block in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
+# Telegram hard limit on caption length.
+CAPTION_LIMIT = 1024
+
+# Balanced defaults (overridable via env / constructor).
+DEFAULT_BATCH_SIZE = 300
+DEFAULT_MIN_FREE_BYTES = 10 * 1024**3  # keep at least 10 GiB free on the download fs
+DEFAULT_BATCH_MAX_DOWNLOAD_BYTES = 5 * 1024**3  # cap bytes downloaded per batch
 
 
 def _safe_name(name: str) -> str:
     return re.sub(r"[^\w.\-]", "_", Path(name).name) or "file"
+
+
+def _caption_from_metadata(item: RecoveryItem) -> str | None:
+    """Derive the date caption without downloading: filename date, then post date."""
+    if item.file_name:
+        parsed = _parse_filename_datetime(item.file_name)
+        if parsed is not None:
+            return format_date_caption(parsed)
+    if item.message_date is not None:
+        return format_date_caption(item.message_date)
+    return None
+
+
+def _merge_caption(existing: str | None, hashtags: str) -> str | None:
+    """Combine any existing caption with the date hashtags.
+
+    Returns None when the message already carries the date tags (no edit needed).
+    Existing free-text is preserved and the tags are appended on a new line,
+    trimming the original only if the result would exceed Telegram's limit.
+    """
+    existing = (existing or "").strip()
+    if not existing:
+        return hashtags
+    if TIDY_CAPTION_RE.search(existing):
+        return None
+    merged = f"{existing}\n\n{hashtags}"
+    if len(merged) > CAPTION_LIMIT:
+        keep = CAPTION_LIMIT - len(hashtags) - 2
+        merged = f"{existing[:keep].rstrip()}\n\n{hashtags}" if keep > 0 else hashtags
+    return merged
 
 
 class RecoveryBusyError(RuntimeError):
@@ -45,10 +84,17 @@ class RecoveryBusyError(RuntimeError):
 
 
 class RecoveryService:
-    """Scans the channel history and re-uploads media as tidy captioned documents.
+    """Adds date-hashtag captions to existing channel media, gradually.
 
-    All operations run in a single background task at a time; the state machine
-    per message lives in the recovery_items table so scans and runs are resumable.
+    Strategy is *hybrid*: for the vast majority of items the capture date is
+    read from the filename (or the message post date) with no download, and the
+    caption is edited in place. Only image documents whose filename lacks a date
+    are downloaded so their EXIF can be read; those downloads are batched and
+    guarded by a free-space floor, and the temp file is deleted immediately.
+
+    Work is processed in bounded batches so the tidy-up can run a little at a
+    time. The per-message state lives in the recovery_items table, so scans and
+    runs are fully resumable.
     """
 
     def __init__(
@@ -60,17 +106,27 @@ class RecoveryService:
         max_retries: int = 3,
         kinds: tuple[str, ...] = MEDIA_KINDS,
         delete_old: bool = True,
+        batch_size: int = DEFAULT_BATCH_SIZE,
+        min_free_bytes: int = DEFAULT_MIN_FREE_BYTES,
+        batch_max_download_bytes: int = DEFAULT_BATCH_MAX_DOWNLOAD_BYTES,
     ) -> None:
         self.telegram = telegram_service
         self.download_root = Path(download_root)
         self.delay_seconds = delay_seconds
         self.max_retries = max_retries
         self.kinds = tuple(kind for kind in kinds if kind in MEDIA_KINDS)
+        # Retained for config compatibility; the in-place tidy edits captions and
+        # never deletes originals, so this is currently informational only.
         self.delete_old = delete_old
+        self.batch_size = batch_size
+        self.min_free_bytes = min_free_bytes
+        self.batch_max_download_bytes = batch_max_download_bytes
 
         self.activity: str | None = None
         self.last_error: str | None = None
         self._task: asyncio.Task[None] | None = None
+        self._batch: dict[str, object] | None = None
+        self._last_batch: dict[str, object] | None = None
 
         self.download_root.mkdir(parents=True, exist_ok=True)
 
@@ -79,11 +135,22 @@ class RecoveryService:
         return self._task is not None and not self._task.done()
 
     def status_snapshot(self) -> dict[str, object]:
+        try:
+            free = shutil.disk_usage(self.download_root).free
+        except OSError:
+            free = None
         return {
             "running": self.running,
             "activity": self.activity if self.running else None,
-            "delete_old": self.delete_old,
             "last_error": self.last_error,
+            "batch": self._batch if self.running else self._last_batch,
+            "batch_size": self.batch_size,
+            "disk": {
+                "download_root": str(self.download_root),
+                "free_bytes": free,
+                "min_free_bytes": self.min_free_bytes,
+                "below_floor": free is not None and free < self.min_free_bytes,
+            },
         }
 
     async def shutdown(self) -> None:
@@ -98,9 +165,15 @@ class RecoveryService:
     def start_scan(self) -> None:
         self._start(self._scan(), "scanning channel history")
 
-    def start_run(self, dry_run: bool) -> None:
-        label = "processing (dry run)" if dry_run else "processing"
-        self._start(self._process_all(dry_run), label)
+    def start_run(
+        self,
+        dry_run: bool,
+        *,
+        limit: int | None = None,
+        max_download_bytes: int | None = None,
+    ) -> None:
+        label = "planning (dry run)" if dry_run else "tidying"
+        self._start(self._process(dry_run, limit, max_download_bytes), label)
 
     def _start(self, coroutine, activity: str) -> None:
         if self.running:
@@ -172,9 +245,7 @@ class RecoveryService:
 
     @staticmethod
     def _is_tidy(message: Message) -> bool:
-        if message.document is None:
-            return False
-        caption = message.caption or ""
+        caption = getattr(message, "caption", None) or ""
         return TIDY_CAPTION_RE.search(caption) is not None
 
     async def _upsert_item(
@@ -207,34 +278,72 @@ class RecoveryService:
 
     # -- processing ---------------------------------------------------------
 
-    async def _process_all(self, dry_run: bool) -> None:
-        processable = [RecoveryStatus.SCANNED, RecoveryStatus.DOWNLOADED]
-        if not dry_run:
-            processable.append(RecoveryStatus.PLANNED)
+    async def _process(
+        self, dry_run: bool, limit: int | None, max_download_bytes: int | None
+    ) -> None:
+        limit = limit or self.batch_size
+        max_download_bytes = max_download_bytes or self.batch_max_download_bytes
+        statuses = [RecoveryStatus.SCANNED, RecoveryStatus.PLANNED]
 
         async with AsyncSessionLocal() as session:
             item_ids = list(
                 await session.scalars(
                     select(RecoveryItem.id)
-                    .where(RecoveryItem.status.in_(processable))
+                    .where(RecoveryItem.status.in_(statuses))
                     .order_by(RecoveryItem.tg_message_id)
+                    .limit(limit)
                 )
             )
 
-        logger.info("Recovery run (dry_run=%s): %s item(s) to process.", dry_run, len(item_ids))
+        batch: dict[str, object] = {
+            "dry_run": dry_run,
+            "total": len(item_ids),
+            "processed": 0,
+            "captioned": 0,
+            "planned": 0,
+            "already": 0,
+            "skipped": 0,
+            "deferred": 0,
+            "failed": 0,
+            "downloaded_bytes": 0,
+        }
+        self._batch = batch
+        logger.info(
+            "Tidy %s: batch of %s item(s).", "dry run" if dry_run else "run", len(item_ids)
+        )
+
         for item_id in item_ids:
-            await self._process_item(item_id, dry_run)
+            outcome = await self._process_item(item_id, dry_run)
+            batch["processed"] = int(batch["processed"]) + 1
+            for key in ("captioned", "planned", "already", "skipped", "deferred", "failed"):
+                if outcome.get(key):
+                    batch[key] = int(batch[key]) + 1
+            batch["downloaded_bytes"] = int(batch["downloaded_bytes"]) + int(
+                outcome.get("downloaded_bytes", 0) or 0
+            )
+
+            if int(batch["downloaded_bytes"]) >= max_download_bytes:
+                logger.info(
+                    "Batch download cap reached (%.1f GB); stopping batch early.",
+                    int(batch["downloaded_bytes"]) / 1024**3,
+                )
+                break
             if self.delay_seconds > 0:
                 await asyncio.sleep(self.delay_seconds)
 
-    async def _process_item(self, item_id: int, dry_run: bool) -> None:
+        self._batch = None
+        self._last_batch = batch
+        logger.info("Tidy batch finished: %s", batch)
+
+    async def _process_item(self, item_id: int, dry_run: bool) -> dict[str, object]:
         async with AsyncSessionLocal() as session:
             item = await session.get(RecoveryItem, item_id)
             if item is None:
-                return
+                return {}
 
+            outcome: dict[str, object] = {}
             try:
-                await self._run_item_steps(session, item, dry_run)
+                outcome = await self._tidy_item(item, dry_run)
             except asyncio.CancelledError:
                 raise
             except FloodWait as exc:
@@ -243,108 +352,105 @@ class RecoveryService:
                 logger.warning("FloodWait: sleeping %.0fs.", wait_seconds)
                 await session.commit()
                 await asyncio.sleep(wait_seconds + 1)
-                return
+                return {"floodwait": True}
             except Exception:
                 item.retry_count += 1
                 item.error_log = traceback.format_exc()
                 if item.retry_count >= self.max_retries:
                     item.status = RecoveryStatus.FAILED
-                logger.exception("Recovery failed for message id=%s", item.tg_message_id)
+                logger.exception("Tidy failed for message id=%s", item.tg_message_id)
+                outcome = {"failed": True}
 
             await session.commit()
+            return outcome
 
-    async def _run_item_steps(self, session, item: RecoveryItem, dry_run: bool) -> None:
+    async def _tidy_item(self, item: RecoveryItem, dry_run: bool) -> dict[str, object]:
         client = self.telegram.client
         channel_id = self.telegram.channel_id
+        downloaded_bytes = 0
 
-        if item.status in (RecoveryStatus.SCANNED, RecoveryStatus.DOWNLOADED):
-            local_path = Path(item.local_path) if item.local_path else None
-            if local_path is None or not local_path.is_file():
-                message = await client.get_messages(channel_id, item.tg_message_id)
-                if message is None or getattr(message, "empty", False):
-                    item.status = RecoveryStatus.SKIPPED
-                    item.error_log = "Source message no longer exists."
-                    return
+        need_exif = item.planned_caption is None and self._needs_exif(item)
+        need_message = need_exif or not dry_run
 
-                base_name = item.file_name or f"{item.media_kind}_{item.tg_message_id}"
-                target = self.download_root / f"{item.tg_message_id}_{_safe_name(base_name)}"
-                downloaded = await client.download_media(message, file_name=str(target))
-                if not downloaded:
-                    raise RuntimeError(f"download_media returned nothing for {item.tg_message_id}")
-                local_path = Path(downloaded)
-                item.local_path = str(local_path)
+        message = None
+        if need_message:
+            message = await client.get_messages(channel_id, item.tg_message_id)
+            if self._is_gone(message):
+                item.status = RecoveryStatus.SKIPPED
+                item.error_log = "Source message no longer exists."
+                return {"skipped": True}
 
-            item.sha256 = await asyncio.to_thread(_sha256_file, local_path)
-            item.status = RecoveryStatus.DOWNLOADED
+        hashtags = item.planned_caption
+        if hashtags is None:
+            if need_exif:
+                if not self._space_for(item.file_size):
+                    free_gb = self._free_bytes() / 1024**3
+                    logger.info(
+                        "Deferring id=%s (%.0f MB): free=%.1f GB would breach %.1f GB floor.",
+                        item.tg_message_id,
+                        (item.file_size or 0) / 1024**2,
+                        free_gb,
+                        self.min_free_bytes / 1024**3,
+                    )
+                    return {"deferred": True}
+                path = await self._download(client, message, item)
+                try:
+                    downloaded_bytes = path.stat().st_size
+                    hashtags = await build_caption(path, fallback=item.message_date)
+                finally:
+                    self._remove(path)
+            else:
+                hashtags = _caption_from_metadata(item)
+            item.planned_caption = hashtags
 
-            if await self._is_duplicate(item):
-                item.status = RecoveryStatus.DUPLICATE
-                self._cleanup_local(item)
-                return
+        if hashtags is None:
+            item.status = RecoveryStatus.SKIPPED
+            item.error_log = "No date could be derived (no filename/EXIF/message date)."
+            return {"skipped": True, "downloaded_bytes": downloaded_bytes}
 
-            item.planned_caption = await build_caption(local_path, fallback=item.message_date)
-            if dry_run:
-                item.status = RecoveryStatus.PLANNED
-                return
+        if dry_run:
+            item.status = RecoveryStatus.PLANNED
+            return {"planned": True, "downloaded_bytes": downloaded_bytes}
 
-        if item.status == RecoveryStatus.PLANNED:
-            if dry_run:
-                return
-            if not item.local_path or not Path(item.local_path).is_file():
-                # Local copy vanished between dry run and real run: start over.
-                item.status = RecoveryStatus.SCANNED
-                return
-
-        if item.status in (RecoveryStatus.PLANNED, RecoveryStatus.DOWNLOADED):
-            caption = item.planned_caption or await build_caption(
-                item.local_path, fallback=item.message_date
-            )
-            upload_name = item.file_name or self._generated_name(item)
-            message = await self.telegram.upload_document(
-                item.local_path, caption=caption, file_name=upload_name
-            )
-            item.new_tg_message_id = message.id
-            item.status = RecoveryStatus.REUPLOADED
-            # Commit before deleting the original: a crash here must never
-            # re-upload (duplicate) or lose track of the replacement message.
-            await session.commit()
-
-        if item.status == RecoveryStatus.REUPLOADED:
-            if self.delete_old:
-                await self.telegram.client.delete_messages(channel_id, item.tg_message_id)
-            self._cleanup_local(item)
+        merged = _merge_caption(getattr(message, "caption", None), hashtags)
+        if merged is None:
             item.status = RecoveryStatus.COMPLETED
+            return {"already": True, "downloaded_bytes": downloaded_bytes}
 
-    async def _is_duplicate(self, item: RecoveryItem) -> bool:
-        if not item.sha256:
-            return False
-        async with AsyncSessionLocal() as session:
-            other = await session.scalar(
-                select(RecoveryItem.id).where(
-                    RecoveryItem.sha256 == item.sha256,
-                    RecoveryItem.id != item.id,
-                    RecoveryItem.status.notin_(
-                        [RecoveryStatus.FAILED, RecoveryStatus.SKIPPED, RecoveryStatus.DUPLICATE]
-                    ),
-                    RecoveryItem.id < item.id,
-                )
-            )
-            return other is not None
-
-    def _generated_name(self, item: RecoveryItem) -> str:
-        extension = ".jpg" if item.media_kind == "photo" else ".bin"
-        if item.local_path:
-            suffix = Path(item.local_path).suffix
-            if suffix:
-                extension = suffix
-        date_part = f"{item.message_date:%Y%m%d_%H%M%S}" if item.message_date else "unknown"
-        return f"{item.media_kind}_{date_part}_{item.tg_message_id}{extension}"
+        await self.telegram.edit_caption(item.tg_message_id, merged)
+        item.status = RecoveryStatus.COMPLETED
+        return {"captioned": True, "downloaded_bytes": downloaded_bytes}
 
     @staticmethod
-    def _cleanup_local(item: RecoveryItem) -> None:
-        if item.local_path:
-            try:
-                os.remove(item.local_path)
-            except FileNotFoundError:
-                pass
-            item.local_path = None
+    def _needs_exif(item: RecoveryItem) -> bool:
+        if item.media_kind != "document":
+            return False
+        name = item.file_name or ""
+        if _parse_filename_datetime(name):
+            return False
+        return Path(name).suffix.lower() in IMAGE_SUFFIXES
+
+    def _free_bytes(self) -> int:
+        return shutil.disk_usage(self.download_root).free
+
+    def _space_for(self, file_size: int | None) -> bool:
+        return self._free_bytes() - (file_size or 0) >= self.min_free_bytes
+
+    async def _download(self, client, message: Message, item: RecoveryItem) -> Path:
+        base_name = item.file_name or f"{item.media_kind}_{item.tg_message_id}"
+        target = self.download_root / f"{item.tg_message_id}_{_safe_name(base_name)}"
+        downloaded = await client.download_media(message, file_name=str(target))
+        if not downloaded:
+            raise RuntimeError(f"download_media returned nothing for {item.tg_message_id}")
+        return Path(downloaded)
+
+    @staticmethod
+    def _is_gone(message: Message | None) -> bool:
+        return message is None or getattr(message, "empty", False)
+
+    @staticmethod
+    def _remove(path: Path) -> None:
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
