@@ -1,0 +1,49 @@
+# teldrive configuration — https://teldrive-docs.pages.dev
+# Fill the placeholders below, then `docker compose up -d`.
+#   __POSTGRES_PASSWORD__  must equal POSTGRES_PASSWORD in .env
+#   __JWT_SECRET__         openssl rand -hex 32
+#   allowed-users          both partners' Telegram usernames (no @)
+
+[db]
+# 'postgres' is the compose service name; port 5432 is the in-network port.
+data-source = 'postgres://teldrive:__POSTGRES_PASSWORD__@postgres:5432/teldrive?sslmode=disable'
+prepare-stmt = true
+log-level = 'info'
+
+[db.pool]
+enable = true
+max-open-connections = 25
+max-idle-connections = 25
+max-lifetime = '10m'
+
+[jwt]
+secret = '__JWT_SECRET__'
+session-time = '30d'
+allowed-users = ['your_username', 'wife_username']
+
+[server]
+port = 8080
+
+[tg]
+# teldrive ships a default Telegram app id/hash; for a personal instance prefer
+# your own from https://my.telegram.org (uncomment and fill).
+# app-id = 1234567
+# app-hash = 'your_app_hash'
+rate-limit = true
+rate = 100
+rate-burst = 5
+pool-size = 8
+
+[tg.session]
+type = 'postgres'
+key = 'session'
+
+[tg.uploads]
+# Optional client-side encryption of chunks. If you set this, BACK IT UP — losing
+# it makes every stored file unrecoverable.
+encryption-key = ''
+# Parallel upload threads per transfer. Together with multi-bot (added in the UI)
+# and rclone --transfers, this is how you beat the non-premium single-account
+# speed throttle: each bot is a separate account with its own limit.
+threads = 8
+max-retries = 10

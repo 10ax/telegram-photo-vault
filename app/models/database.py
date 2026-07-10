@@ -83,6 +83,8 @@ class Photo(Base):
     )
     tg_message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     tg_media_message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    # Native captioned copy mirrored to the shared browse channel (best-effort).
+    browse_tg_message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     is_chunked: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
     total_size: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
@@ -180,6 +182,7 @@ _COLUMN_MIGRATIONS: dict[str, dict[str, str]] = {
         "total_size": "BIGINT",
         "manifest_tg_message_id": "BIGINT",
         "tg_media_message_id": "BIGINT",
+        "browse_tg_message_id": "BIGINT",
     },
 }
 

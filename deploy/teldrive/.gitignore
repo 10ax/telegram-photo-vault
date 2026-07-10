@@ -1,0 +1,4 @@
+# Local secrets / filled config / DB dumps — never commit these.
+.env
+config.toml
+backups/

@@ -1,0 +1,38 @@
+name: teldrive
+
+# Shared "family Telegram drive" — teldrive over a bundled Postgres.
+# Postgres is NOT exposed to the host; only teldrive talks to it.
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: teldrive-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-teldrive}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-teldrive}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-teldrive} -d ${POSTGRES_DB:-teldrive}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  teldrive:
+    image: ghcr.io/tgdrive/teldrive:latest
+    container_name: teldrive
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    volumes:
+      # Filled-in config (see config.toml). The DB password here must match .env.
+      - ./config.toml:/config.toml:ro
+    # If the image's default entrypoint doesn't auto-load /config.toml, uncomment:
+    # command: ["run", "--config", "/config.toml"]
+
+volumes:
+  pgdata:

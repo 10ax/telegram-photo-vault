@@ -79,10 +79,14 @@ async def lifespan(app: FastAPI):
 
     try:
         mega_service = MegaService(target_folder=os.getenv("MEGA_TARGET_FOLDER", "/Camera"))
+        browse_channel_raw = _optional_env("BROWSE_CHANNEL_ID")
         telegram_service = TelegramService(
             telegram_client,
             telegram_channel_id,
             upload_delay_seconds=float(os.getenv("TELEGRAM_UPLOAD_DELAY", "5")),
+            browse_channel_id=(
+                _parse_int_or_str(browse_channel_raw) if browse_channel_raw else None
+            ),
         )
 
         sftp_key_path = _optional_env("ODROID_KEY_PATH")
@@ -114,6 +118,7 @@ async def lifespan(app: FastAPI):
             batch_size=int(os.getenv("WORKER_BATCH_SIZE", "50")),
             chunk_size=int(os.getenv("CHUNK_SIZE", "1900000000")),
             chunk_threshold=int(os.getenv("CHUNK_THRESHOLD", "1950000000")),
+            browse_max_video_mb=int(os.getenv("BROWSE_MAX_VIDEO_MB", "0")),
         )
 
         recovery_kinds = tuple(

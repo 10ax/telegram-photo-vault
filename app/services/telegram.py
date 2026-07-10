@@ -110,10 +110,15 @@ class TelegramService:
         channel_id: int | str,
         *,
         upload_delay_seconds: float = 5.0,
+        browse_channel_id: int | str | None = None,
     ) -> None:
         self.client = client
         self.channel_id = channel_id
         self.upload_delay_seconds = upload_delay_seconds
+        # Optional shared "browse" channel: native captioned copies for humans to
+        # scroll/search in the Telegram app (the main channel holds the archival
+        # documents + chunk parts + manifests). None disables mirroring.
+        self.browse_channel_id = browse_channel_id
 
     async def upload_document(
         self,
@@ -209,6 +214,47 @@ class TelegramService:
         except MessageNotModified:
             pass
         return True
+
+    async def publish_browse(
+        self,
+        file_path: str | Path,
+        media_type,
+        *,
+        caption: str | None = None,
+        caption_fallback: datetime | None = None,
+    ) -> Message | None:
+        """Mirror a native captioned photo/video to the shared browse channel.
+
+        Best-effort: returns None if browsing is disabled, the type is
+        unsupported, or the send fails — a browse-copy failure must never break
+        the archival pipeline.
+        """
+        if self.browse_channel_id is None:
+            return None
+
+        from app.models.database import MediaType
+
+        path = Path(file_path)
+        if caption is None:
+            caption = await build_caption(path, fallback=caption_fallback)
+
+        try:
+            if media_type == MediaType.IMAGE:
+                message = await self.client.send_photo(
+                    chat_id=self.browse_channel_id, photo=str(path), caption=caption
+                )
+            elif media_type == MediaType.VIDEO:
+                message = await self.client.send_video(
+                    chat_id=self.browse_channel_id, video=str(path), caption=caption
+                )
+            else:
+                return None
+        except Exception:
+            return None
+
+        if self.upload_delay_seconds > 0:
+            await asyncio.sleep(self.upload_delay_seconds)
+        return message
 
     async def find_document_by_name(self, file_name: str) -> Message | None:
         """Best-effort channel search for a document with this exact filename.

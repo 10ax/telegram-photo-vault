@@ -31,6 +31,8 @@ Pyrogram fork, same `pyrogram` namespace), Pillow (+pillow-heif), asyncssh.
 - `scripts/vault_merge.py`: standalone (stdlib-only) chunk verify+merge CLI
 - `tests/`: pytest suite (pure functions + functional flows with fakes)
 - `Dockerfile`, `docker-compose.yml`: containerized runtime
+- `deploy/teldrive/`: optional self-hosted teldrive "family drive" (Telegram-backed
+  shared cloud drive: compose + Postgres + DB-backup + iPhone-folder seed script)
 
 ## State machines
 - Photo: `PENDING → DOWNLOADED → [CHUNK_UPLOADING →] TG_UPLOADED → COMPRESSED →
@@ -73,6 +75,13 @@ Pyrogram fork, same `pyrogram` namespace), Pillow (+pillow-heif), asyncssh.
 - `TELEGRAM_SESSION_STRING`
 - `TELEGRAM_UPLOAD_DELAY` (default: `5`)
 - `TELEGRAM_SLEEP_THRESHOLD` (default: `60`; auto-sleep on FloodWait below this)
+- `BROWSE_CHANNEL_ID` (optional; a second channel that both people join. When set,
+  the worker mirrors a native, date-captioned photo/video there for gallery-style
+  scrolling + `#YYYY_MM_DD` search inside the Telegram app. Best-effort — a mirror
+  failure never breaks the archival pipeline. The main channel keeps the archival
+  documents/chunks/manifests.)
+- `BROWSE_MAX_VIDEO_MB` (default: `0` = photos only; videos up to this size are
+  also mirrored, larger videos stay archival-only)
 - `ODROID_PORT` (default: `22`), `ODROID_PASSWORD`, `ODROID_KEY_PATH`
 - `ODROID_REMOTE_DIR` (default: `/srv/photo-vault`)
 - `ODROID_ALLOW_INSECURE_HOST_KEY` (default: `false`; test-only)

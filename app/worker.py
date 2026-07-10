@@ -76,6 +76,7 @@ class PhotoWorker:
         batch_size: int = 50,
         chunk_size: int = DEFAULT_CHUNK_SIZE,
         chunk_threshold: int = 1_950_000_000,
+        browse_max_video_mb: int = 0,
     ) -> None:
         if mode not in WORKER_MODES:
             raise ValueError(f"Unsupported worker mode: {mode!r} (expected one of {WORKER_MODES})")
@@ -93,6 +94,8 @@ class PhotoWorker:
         self.batch_size = batch_size
         self.chunk_size = chunk_size
         self.chunk_threshold = chunk_threshold
+        # Videos up to this size are also mirrored to the browse channel; 0 = photos only.
+        self.browse_max_video_bytes = max(browse_max_video_mb, 0) * 1024 * 1024
 
         self.running = False
         self.last_run_started_at: datetime | None = None
@@ -302,7 +305,30 @@ class PhotoWorker:
         if media_message is not None:
             photo.tg_media_message_id = media_message.id
 
+        browse_message = await self._maybe_publish_browse(local_path, photo)
+        if browse_message is not None:
+            photo.browse_tg_message_id = browse_message.id
+
         photo.status = PhotoStatus.TG_UPLOADED
+
+    async def _maybe_publish_browse(self, local_path: Path, photo: Photo):
+        """Mirror a native captioned copy to the shared browse channel.
+
+        Photos always; videos only up to ``browse_max_video_bytes`` (large videos
+        stay archival-only). No-op unless the Telegram service has a browse
+        channel configured, so fakes/tests without one are untouched.
+        """
+        if getattr(self.telegram_service, "browse_channel_id", None) is None:
+            return None
+        if photo.media_type == MediaType.IMAGE:
+            return await self.telegram_service.publish_browse(local_path, photo.media_type)
+        if (
+            photo.media_type == MediaType.VIDEO
+            and self.browse_max_video_bytes > 0
+            and local_path.stat().st_size <= self.browse_max_video_bytes
+        ):
+            return await self.telegram_service.publish_browse(local_path, photo.media_type)
+        return None
 
     async def _prepare_chunks(
         self, session, photo: Photo, local_path: Path, total_size: int
