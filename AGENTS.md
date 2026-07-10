@@ -58,6 +58,9 @@ Pyrogram fork, same `pyrogram` namespace), Pillow (+pillow-heif), asyncssh.
 - `POST /api/recovery/scan`, `POST /api/recovery/run`
   (`{"dry_run": true|false, "limit"?, "max_download_bytes"?}`, dry_run default
   true; each call processes one batch), `GET /api/recovery/items?status=`
+- `POST /api/recovery/backfill` (`{"limit"?, "max_video_bytes"?}`) — copy existing
+  native photo/video/animation messages into `BROWSE_CHANNEL_ID` as a gallery,
+  server-side (no download), resumable via `recovery_items.browse_tg_message_id`
 - `GET /api/system` — disk usage
 
 ## Required Environment Variables

@@ -158,6 +158,8 @@ class RecoveryItem(Base):
     sha256: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     planned_caption: Mapped[str | None] = mapped_column(Text, nullable=True)
     new_tg_message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    # Set once this item has been copied into the shared browse gallery channel.
+    browse_tg_message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     retry_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     error_log: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
@@ -182,6 +184,9 @@ _COLUMN_MIGRATIONS: dict[str, dict[str, str]] = {
         "total_size": "BIGINT",
         "manifest_tg_message_id": "BIGINT",
         "tg_media_message_id": "BIGINT",
+        "browse_tg_message_id": "BIGINT",
+    },
+    "recovery_items": {
         "browse_tg_message_id": "BIGINT",
     },
 }

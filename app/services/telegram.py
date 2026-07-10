@@ -256,6 +256,24 @@ class TelegramService:
             await asyncio.sleep(self.upload_delay_seconds)
         return message
 
+    async def copy_to_browse(
+        self, from_chat_id: int | str, message_id: int, *, caption: str | None = None
+    ) -> Message | None:
+        """Server-side copy of an existing media message into the browse channel.
+
+        Uses Telegram's copy (no download, no re-upload — the bytes never touch
+        this machine). Returns None when browsing is disabled. Errors (incl.
+        FloodWait) propagate so the caller can pace/retry.
+        """
+        if self.browse_channel_id is None:
+            return None
+        return await self.client.copy_message(
+            chat_id=self.browse_channel_id,
+            from_chat_id=from_chat_id,
+            message_id=message_id,
+            caption=caption,
+        )
+
     async def find_document_by_name(self, file_name: str) -> Message | None:
         """Best-effort channel search for a document with this exact filename.
 

@@ -24,6 +24,11 @@ logger = logging.getLogger(__name__)
 
 MEDIA_KINDS = ("photo", "video", "document", "animation")
 
+# Kinds that render as a thumbnail gallery / play inline in the browse channel.
+# Documents are intentionally excluded (they show as files, not a photo grid);
+# they stay date-searchable in the main channel via the tidy.
+BROWSE_MEDIA_KINDS = ("photo", "video", "animation")
+
 # Messages this project created for chunked uploads; never "tidy" those.
 CHUNK_PART_RE = re.compile(r"\.part\d+-of-\d+$")
 MANIFEST_SUFFIX = ".manifest.json"
@@ -174,6 +179,11 @@ class RecoveryService:
     ) -> None:
         label = "planning (dry run)" if dry_run else "tidying"
         self._start(self._process(dry_run, limit, max_download_bytes), label)
+
+    def start_backfill(
+        self, *, limit: int | None = None, max_video_bytes: int | None = None
+    ) -> None:
+        self._start(self._backfill(limit, max_video_bytes), "backfilling browse channel")
 
     def _start(self, coroutine, activity: str) -> None:
         if self.running:
@@ -420,6 +430,91 @@ class RecoveryService:
         await self.telegram.edit_caption(item.tg_message_id, merged)
         item.status = RecoveryStatus.COMPLETED
         return {"captioned": True, "downloaded_bytes": downloaded_bytes}
+
+    # -- browse backfill ----------------------------------------------------
+
+    async def _backfill(self, limit: int | None, max_video_bytes: int | None) -> None:
+        if self.telegram.browse_channel_id is None:
+            raise RuntimeError("No browse channel configured (set BROWSE_CHANNEL_ID).")
+        limit = limit or self.batch_size
+
+        async with AsyncSessionLocal() as session:
+            item_ids = list(
+                await session.scalars(
+                    select(RecoveryItem.id)
+                    .where(
+                        RecoveryItem.media_kind.in_(BROWSE_MEDIA_KINDS),
+                        RecoveryItem.browse_tg_message_id.is_(None),
+                    )
+                    .order_by(RecoveryItem.tg_message_id)
+                    .limit(limit)
+                )
+            )
+
+        batch: dict[str, object] = {
+            "mode": "backfill",
+            "total": len(item_ids),
+            "processed": 0,
+            "copied": 0,
+            "skipped": 0,
+            "failed": 0,
+        }
+        self._batch = batch
+        logger.info("Browse backfill: %s candidate item(s).", len(item_ids))
+
+        for item_id in item_ids:
+            outcome = await self._backfill_item(item_id, max_video_bytes)
+            batch["processed"] = int(batch["processed"]) + 1
+            for key in ("copied", "skipped", "failed"):
+                if outcome.get(key):
+                    batch[key] = int(batch[key]) + 1
+            if self.delay_seconds > 0:
+                await asyncio.sleep(self.delay_seconds)
+
+        self._batch = None
+        self._last_batch = batch
+        logger.info("Browse backfill finished: %s", batch)
+
+    async def _backfill_item(
+        self, item_id: int, max_video_bytes: int | None
+    ) -> dict[str, object]:
+        async with AsyncSessionLocal() as session:
+            item = await session.get(RecoveryItem, item_id)
+            if item is None or item.browse_tg_message_id is not None:
+                return {}
+
+            if (
+                max_video_bytes
+                and item.media_kind == "video"
+                and (item.file_size or 0) > max_video_bytes
+            ):
+                return {"skipped": True}
+
+            outcome: dict[str, object] = {}
+            try:
+                caption = item.planned_caption or _caption_from_metadata(item)
+                copied = await self.telegram.copy_to_browse(
+                    self.telegram.channel_id, item.tg_message_id, caption=caption
+                )
+                if copied is None:
+                    return {"skipped": True}
+                item.browse_tg_message_id = copied.id
+                outcome = {"copied": True}
+            except asyncio.CancelledError:
+                raise
+            except FloodWait as exc:
+                wait_seconds = float(getattr(exc, "value", 30) or 30)
+                logger.warning("FloodWait (backfill): sleeping %.0fs.", wait_seconds)
+                await asyncio.sleep(wait_seconds + 1)
+                return {"floodwait": True}
+            except Exception:
+                item.retry_count += 1
+                item.error_log = traceback.format_exc()
+                logger.exception("Backfill failed for message id=%s", item.tg_message_id)
+                outcome = {"failed": True}
+
+            await session.commit()
+            return outcome
 
     @staticmethod
     def _needs_exif(item: RecoveryItem) -> bool:

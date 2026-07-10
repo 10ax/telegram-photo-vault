@@ -236,6 +236,26 @@ async def recovery_run(request: Request, payload: RecoveryRunRequest | None = No
     return recovery.status_snapshot()
 
 
+class RecoveryBackfillRequest(BaseModel):
+    limit: int | None = None
+    # Skip native videos larger than this (bytes). None = copy all sizes.
+    max_video_bytes: int | None = None
+
+
+@router.post("/recovery/backfill")
+async def recovery_backfill(
+    request: Request, payload: RecoveryBackfillRequest | None = None
+) -> dict[str, object]:
+    recovery = _require_recovery(request)
+    limit = payload.limit if payload is not None else None
+    max_video_bytes = payload.max_video_bytes if payload is not None else None
+    try:
+        recovery.start_backfill(limit=limit, max_video_bytes=max_video_bytes)
+    except RecoveryBusyError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+    return recovery.status_snapshot()
+
+
 @router.get("/recovery/items")
 async def recovery_items(
     status_filter: str | None = Query(default=None, alias="status"),
