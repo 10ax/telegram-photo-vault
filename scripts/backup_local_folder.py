@@ -379,6 +379,7 @@ async def process_file(
 
 def print_report(conn: sqlite3.Connection) -> None:
     counts = status_counts(conn)
+    total = sum(counts.values())
     print(" ".join(f"{status}: {count}" for status, count in sorted(counts.items())))
     channel_id = get_meta(conn, "channel_id")
     if channel_id:
@@ -388,6 +389,13 @@ def print_report(conn: sqlite3.Connection) -> None:
         print("Failed files:")
         for rel_path, error in failures:
             print(f"  {rel_path} — {error}")
+    verified = counts.get("VERIFIED", 0)
+    if total == 0:
+        print("NOT SAFE TO DELETE: 0 files tracked.")
+    elif verified == total:
+        print(f"SAFE TO DELETE: {verified}/{total} files VERIFIED.")
+    else:
+        print(f"NOT SAFE TO DELETE: {total - verified}/{total} file(s) not VERIFIED yet.")
 
 
 async def main(argv=None) -> None:
@@ -413,16 +421,33 @@ async def main(argv=None) -> None:
         action="store_true",
         help="Scan and report counts without connecting to Telegram",
     )
+    parser.add_argument(
+        "--channel-id",
+        type=int,
+        default=None,
+        help="Adopt an existing channel instead of creating a new one (seeds meta.channel_id)",
+    )
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 
     source_root = Path(args.source)
+    if not source_root.is_dir():
+        raise SystemExit(f"--source path does not exist or is not a directory: {source_root}")
     tmp_verify_dir = Path(args.tmp_verify_dir)
 
     conn = open_state_db(Path(args.state_db))
     inserted = scan_folder(conn, source_root)
     logger.info("scan complete: %d new file(s) tracked", inserted)
+
+    total_tracked = sum(status_counts(conn).values())
+    if total_tracked == 0:
+        print_report(conn)
+        raise SystemExit(
+            f"No files tracked after scanning {source_root} — refusing to continue. "
+            "An empty or misconfigured source directory would otherwise look like "
+            "nothing-to-do success."
+        )
 
     if args.scan_only:
         print_report(conn)
@@ -434,6 +459,12 @@ async def main(argv=None) -> None:
     # (needed there since resumed/direct calls don't go through main() at all); the
     # call here just fails fast before opening the Telegram client.
     tmp_verify_dir.mkdir(parents=True, exist_ok=True)
+    for stray in tmp_verify_dir.iterdir():
+        if stray.is_file():
+            stray.unlink()
+
+    if args.channel_id is not None:
+        set_meta(conn, "channel_id", str(args.channel_id))
 
     client = build_client()
     try:
@@ -441,7 +472,10 @@ async def main(argv=None) -> None:
             channel_id = await get_or_create_channel_id(client, conn)
             service = TelegramService(client, channel_id, upload_delay_seconds=args.delay)
 
-            for rel_path in pending_rel_paths(conn):
+            pending = pending_rel_paths(conn)
+            total = len(pending)
+            for index, rel_path in enumerate(pending, start=1):
+                logger.info("[%d/%d] %s", index, total, rel_path)
                 await process_file(
                     client,
                     service,

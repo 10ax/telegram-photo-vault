@@ -224,8 +224,8 @@ async def test_upload_chunked_splits_uploads_and_builds_manifest(tmp_path):
     # Per-chunk hashes in the manifest must be real (this is what scripts/vault_merge.py
     # verifies against before it will merge parts back into the original file).
     for spec in service.manifest_payload["chunks"]:
-        expected = chunk_hashes[spec["index"] - 1]
-        assert spec["sha256"] == expected
+        uploaded_bytes = service.chunk_payloads[spec["filename"]]
+        assert spec["sha256"] == hashlib.sha256(uploaded_bytes).hexdigest()
         assert spec["sha256"] != ""
     assert "107APPLE/IMG_7023.MOV" in service.chunk_captions["IMG_7023.MOV.part001-of-003"]
     assert "107APPLE/IMG_7023.MOV" in service.manifest_caption
@@ -442,3 +442,24 @@ async def test_main_scan_only_reports_without_touching_telegram(tmp_path, monkey
 
     out = capsys.readouterr().out
     assert "PENDING: 2" in out
+
+
+async def test_main_aborts_when_source_is_empty(tmp_path, monkeypatch, capsys):
+    source = tmp_path / "source"
+    source.mkdir()  # exists, but has no files — e.g. an unmounted volume
+
+    def _fail_build_client():
+        raise AssertionError("build_client must not be called when 0 files are tracked")
+
+    monkeypatch.setattr("scripts.backup_local_folder.build_client", _fail_build_client)
+
+    with pytest.raises(SystemExit):
+        await main(
+            [
+                "--source", str(source),
+                "--state-db", str(tmp_path / "state.db"),
+            ]
+        )
+
+    out = capsys.readouterr().out
+    assert "NOT SAFE TO DELETE: 0 files tracked." in out
