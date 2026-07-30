@@ -309,6 +309,17 @@ async def process_file(
     sha256 = row["sha256"]
     tg_message_id = row["tg_message_id"]
 
+    if status == "FAILED":
+        # The design's resumability contract is "any row not already VERIFIED is
+        # retried" — pending_rel_paths() already includes FAILED rows, but nothing
+        # upstream re-derives which step to resume from a failure (unlike the
+        # production app's separate failed_status column). Restarting the whole
+        # per-file pipeline is simple, correct, and cheap enough at this dataset's
+        # scale (a handful of transient failures out of thousands of files, not a
+        # systematic pattern) — the alternative (tracking exactly which step failed)
+        # isn't justified by the size of the problem it would solve here.
+        status = "PENDING"
+
     try:
         # Ensure the verify scratch dir exists before any verify_* call needs to write
         # into it. Cheap and idempotent, so doing it per-file (rather than once in

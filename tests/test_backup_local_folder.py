@@ -396,6 +396,31 @@ async def test_process_file_chunked_path_verifies_end_to_end(tmp_path):
     assert row["manifest_tg_message_id"] is not None
 
 
+async def test_process_file_retries_a_previously_failed_row(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "IMG_0003.HEIC").write_bytes(b"z" * 100)
+    conn = open_state_db(tmp_path / "state.db")
+    scan_folder(conn, source)
+    # Simulate a row left FAILED by a prior run (e.g. a transient network error) —
+    # stale sha256/tg_message_id from a step that never actually completed.
+    set_status(
+        conn, "IMG_0003.HEIC", "FAILED", sha256="stale", tg_message_id=999,
+        error="Connection reset by peer",
+    )
+    client = FakeFullClient()
+    service = FakeFullService(client)
+
+    await process_file(
+        client, service, conn, source, "IMG_0003.HEIC", client.channel_id,
+        chunk_threshold=1_000_000, chunk_size=500_000, tmp_verify_dir=tmp_path / "verify",
+    )
+
+    row = get_row(conn, "IMG_0003.HEIC")
+    assert row["status"] == "VERIFIED"
+    assert row["error"] is None
+
+
 async def test_main_scan_only_reports_without_touching_telegram(tmp_path, monkeypatch, capsys):
     source = tmp_path / "source"
     source.mkdir()
