@@ -128,3 +128,37 @@ async def test_get_or_create_channel_id_reuses_stored_id(tmp_path):
 
     assert channel_id == -1001111111111
     assert client.create_channel_calls == []
+
+
+from scripts.backup_local_folder import build_caption, upload_single
+
+
+class FakeUploadService:
+    def __init__(self):
+        self.calls = []
+
+    async def upload_document(self, file_path, *, caption=None, file_name=None):
+        self.calls.append({"file_path": file_path, "caption": caption, "file_name": file_name})
+        return SimpleNamespace(id=555)
+
+
+def test_build_caption_contains_path_size_and_hash_prefix():
+    caption = build_caption("106APPLE/IMG_6849.MOV", 2476877121, "a" * 64)
+
+    assert caption == "106APPLE/IMG_6849.MOV\nsize=2476877121 sha256=" + "a" * 16
+
+
+@pytest.mark.asyncio
+async def test_upload_single_calls_service_and_returns_message_id(tmp_path):
+    abs_path = tmp_path / "IMG_0001.HEIC"
+    abs_path.write_bytes(b"x" * 10)
+    service = FakeUploadService()
+
+    message_id = await upload_single(service, abs_path, "100APPLE/IMG_0001.HEIC", 10, "b" * 64)
+
+    assert message_id == 555
+    assert len(service.calls) == 1
+    call = service.calls[0]
+    assert call["file_path"] == abs_path
+    assert call["file_name"] == "IMG_0001.HEIC"
+    assert call["caption"] == "100APPLE/IMG_0001.HEIC\nsize=10 sha256=" + "b" * 16

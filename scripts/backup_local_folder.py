@@ -158,3 +158,16 @@ async def get_or_create_channel_id(client, conn: sqlite3.Connection) -> int:
     channel = await client.create_channel(CHANNEL_TITLE)
     set_meta(conn, "channel_id", str(channel.id))
     return channel.id
+
+
+def build_caption(rel_path: str, size: int, sha256: str) -> str:
+    return f"{rel_path}\nsize={size} sha256={sha256[:16]}"
+
+
+async def upload_single(service, abs_path: Path, rel_path: str, size: int, sha256: str) -> int:
+    message = await service.upload_document(
+        abs_path,
+        caption=build_caption(rel_path, size, sha256),
+        file_name=abs_path.name,
+    )
+    return message.id
