@@ -506,7 +506,7 @@ git commit -m "feat: add single-file upload path"
 **Interfaces:**
 - Consumes: nothing new from earlier tasks.
 - Produces:
-  - `async def upload_chunked(service, abs_path: Path, rel_path: str, size: int, sha256: str, chunk_size: int) -> tuple[Message, int, list[Message]]` — `(manifest_message, chunk_count, chunk_messages)`
+  - `async def upload_chunked(service, abs_path: Path, rel_path: str, size: int, sha256: str, chunk_size: int, chunk_hashes: list[str]) -> tuple[Message, int, list[Message]]` — `(manifest_message, chunk_count, chunk_messages)`. `chunk_hashes` is the per-chunk SHA-256 list from `compute_hashes(abs_path, chunk_size)` (same call the caller already makes at the HASHED step) — it is threaded through so the manifest's per-chunk `sha256` field is real, not a placeholder. `scripts/vault_merge.py` verifies every part's hash against this field before merging; an empty/wrong value silently breaks that recovery path, so this is load-bearing, not cosmetic.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -545,10 +545,12 @@ async def test_upload_chunked_splits_uploads_and_builds_manifest(tmp_path):
     abs_path = tmp_path / "IMG_7023.MOV"
     abs_path.write_bytes(data)
     sha256 = hashlib.sha256(data).hexdigest()
+    chunk_size = 4_000
+    _, chunk_hashes = compute_hashes(abs_path, chunk_size)
     service = FakeChunkService()
 
     manifest_message, count, chunk_messages = await upload_chunked(
-        service, abs_path, "107APPLE/IMG_7023.MOV", len(data), sha256, chunk_size=4_000
+        service, abs_path, "107APPLE/IMG_7023.MOV", len(data), sha256, chunk_size, chunk_hashes
     )
 
     assert count == 3
@@ -565,9 +567,17 @@ async def test_upload_chunked_splits_uploads_and_builds_manifest(tmp_path):
     assert joined == data
     assert service.manifest_payload["sha256"] == sha256
     assert service.manifest_payload["chunk_count"] == 3
+    # Per-chunk hashes in the manifest must be real (this is what scripts/vault_merge.py
+    # verifies against before it will merge parts back into the original file).
+    for spec in service.manifest_payload["chunks"]:
+        expected = chunk_hashes[spec["index"] - 1]
+        assert spec["sha256"] == expected
+        assert spec["sha256"] != ""
     assert "107APPLE/IMG_7023.MOV" in service.chunk_captions["IMG_7023.MOV.part001-of-003"]
     assert "107APPLE/IMG_7023.MOV" in service.manifest_caption
 ```
+
+Add `from app.services.chunking import compute_hashes` to the test file's imports if not already present (Task 1's imports don't include it; add it alongside the `import hashlib`/`import json` lines already being added in this task's Step 1).
 
 - [ ] **Step 2: Run test to verify it fails**
 
@@ -597,7 +607,13 @@ Append to `scripts/backup_local_folder.py`:
 
 ```python
 async def upload_chunked(
-    service, abs_path: Path, rel_path: str, size: int, sha256: str, chunk_size: int
+    service,
+    abs_path: Path,
+    rel_path: str,
+    size: int,
+    sha256: str,
+    chunk_size: int,
+    chunk_hashes: list[str],
 ):
     base_name = Path(rel_path).name
     plan = plan_chunks(size, chunk_size)
@@ -627,7 +643,7 @@ async def upload_chunked(
                 "filename": name,
                 "offset": spec["offset"],
                 "size": spec["size"],
-                "sha256": "",
+                "sha256": chunk_hashes[spec["index"] - 1],
             }
         )
 
@@ -1000,8 +1016,15 @@ async def process_file(
 
         if status == "HASHED":
             if size > chunk_threshold:
+                # Recomputed rather than threaded from the PENDING branch above: a run
+                # resumed after a crash enters here with status already HASHED (no
+                # PENDING step this call), so chunk_hashes must be derived fresh either
+                # way. The extra pass over the file only affects the handful of files
+                # above chunk_threshold, and is negligible next to their upload+verify
+                # time.
+                _, chunk_hashes = compute_hashes(abs_path, chunk_size)
                 manifest_message, count, chunk_messages = await upload_chunked(
-                    service, abs_path, rel_path, size, sha256, chunk_size
+                    service, abs_path, rel_path, size, sha256, chunk_size, chunk_hashes
                 )
                 ok = await verify_chunked(client, chunk_messages, sha256, tmp_verify_dir)
                 set_status(
