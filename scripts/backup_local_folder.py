@@ -251,13 +251,18 @@ _HASH_BLOCK_SIZE = 4 * 1024 * 1024
 
 async def _download_and_hash(client, message, tmp_dir: Path) -> str:
     tmp_path = tmp_dir / f"verify_{message.id}"
-    await client.download_media(message, file_name=str(tmp_path))
-    hasher = hashlib.sha256()
-    with open(tmp_path, "rb") as handle:
-        for block in iter(lambda: handle.read(_HASH_BLOCK_SIZE), b""):
-            hasher.update(block)
-    tmp_path.unlink()
-    return hasher.hexdigest()
+    try:
+        await client.download_media(message, file_name=str(tmp_path))
+        hasher = hashlib.sha256()
+        with open(tmp_path, "rb") as handle:
+            for block in iter(lambda: handle.read(_HASH_BLOCK_SIZE), b""):
+                hasher.update(block)
+        return hasher.hexdigest()
+    finally:
+        # try/finally, not a plain unlink() after the read: a mid-transfer exception
+        # (FloodWait, network blip, disk full) must not leave a partial file behind —
+        # this runs for hours over 106GB, so at-least-one interruption is expected.
+        tmp_path.unlink(missing_ok=True)
 
 
 async def verify_single(
@@ -272,9 +277,11 @@ async def verify_chunked(client, chunk_messages: list, expected_sha256: str, tmp
     hasher = hashlib.sha256()
     for message in chunk_messages:
         tmp_path = tmp_dir / f"verify_{message.id}"
-        await client.download_media(message, file_name=str(tmp_path))
-        with open(tmp_path, "rb") as handle:
-            for block in iter(lambda: handle.read(_HASH_BLOCK_SIZE), b""):
-                hasher.update(block)
-        tmp_path.unlink()
+        try:
+            await client.download_media(message, file_name=str(tmp_path))
+            with open(tmp_path, "rb") as handle:
+                for block in iter(lambda: handle.read(_HASH_BLOCK_SIZE), b""):
+                    hasher.update(block)
+        finally:
+            tmp_path.unlink(missing_ok=True)
     return hasher.hexdigest() == expected_sha256
