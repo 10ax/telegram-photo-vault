@@ -162,3 +162,60 @@ async def test_upload_single_calls_service_and_returns_message_id(tmp_path):
     assert call["file_path"] == abs_path
     assert call["file_name"] == "IMG_0001.HEIC"
     assert call["caption"] == "100APPLE/IMG_0001.HEIC\nsize=10 sha256=" + "b" * 16
+
+
+import hashlib
+import json
+
+from scripts.backup_local_folder import upload_chunked
+
+
+class FakeChunkService:
+    def __init__(self):
+        self.next_id = 700
+        self.chunk_payloads = {}
+        self.manifest_payload = None
+        self.manifest_caption = None
+        self.chunk_captions = {}
+
+    async def upload_file_object(self, file_object, caption):
+        self.chunk_payloads[file_object.name] = file_object.read()
+        self.chunk_captions[file_object.name] = caption
+        self.next_id += 1
+        return SimpleNamespace(id=self.next_id)
+
+    async def upload_bytes(self, data, *, file_name, caption):
+        self.manifest_payload = json.loads(data)
+        self.manifest_caption = caption
+        self.next_id += 1
+        return SimpleNamespace(id=self.next_id)
+
+
+@pytest.mark.asyncio
+async def test_upload_chunked_splits_uploads_and_builds_manifest(tmp_path):
+    data = bytes(range(256)) * 40  # 10_240 bytes
+    abs_path = tmp_path / "IMG_7023.MOV"
+    abs_path.write_bytes(data)
+    sha256 = hashlib.sha256(data).hexdigest()
+    service = FakeChunkService()
+
+    manifest_message, count, chunk_messages = await upload_chunked(
+        service, abs_path, "107APPLE/IMG_7023.MOV", len(data), sha256, chunk_size=4_000
+    )
+
+    assert count == 3
+    assert len(chunk_messages) == 3
+    assert manifest_message.id == service.next_id
+    assert set(service.chunk_payloads) == {
+        "IMG_7023.MOV.part001-of-003",
+        "IMG_7023.MOV.part002-of-003",
+        "IMG_7023.MOV.part003-of-003",
+    }
+    joined = b"".join(
+        service.chunk_payloads[f"IMG_7023.MOV.part{i:03d}-of-003"] for i in (1, 2, 3)
+    )
+    assert joined == data
+    assert service.manifest_payload["sha256"] == sha256
+    assert service.manifest_payload["chunk_count"] == 3
+    assert "107APPLE/IMG_7023.MOV" in service.chunk_captions["IMG_7023.MOV.part001-of-003"]
+    assert "107APPLE/IMG_7023.MOV" in service.manifest_caption

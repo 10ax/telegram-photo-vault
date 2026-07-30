@@ -6,6 +6,7 @@ Design: docs/superpowers/specs/2026-07-30-iphone-backup-telegram-design.md
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import sqlite3
@@ -13,6 +14,17 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from pyrogram import Client
+
+from app.services.chunking import (
+    ChunkWindow,
+    build_chunk_caption,
+    build_manifest,
+    build_manifest_caption,
+    chunk_name,
+    compute_hashes,
+    manifest_name,
+    plan_chunks,
+)
 
 logger = logging.getLogger("backup_local_folder")
 
@@ -171,3 +183,57 @@ async def upload_single(service, abs_path: Path, rel_path: str, size: int, sha25
         file_name=abs_path.name,
     )
     return message.id
+
+
+async def upload_chunked(
+    service, abs_path: Path, rel_path: str, size: int, sha256: str, chunk_size: int
+):
+    base_name = Path(rel_path).name
+    plan = plan_chunks(size, chunk_size)
+    count = len(plan)
+    chunk_records = []
+    chunk_messages = []
+
+    for spec in plan:
+        name = chunk_name(base_name, spec["index"], count)
+        window = ChunkWindow(abs_path, spec["offset"], spec["size"], name)
+        try:
+            caption = build_chunk_caption(
+                rel_path,
+                index=spec["index"],
+                count=count,
+                original_filename=base_name,
+                total_size=size,
+                sha256=sha256,
+            )
+            message = await service.upload_file_object(window, caption)
+        finally:
+            window.close()
+        chunk_messages.append(message)
+        chunk_records.append(
+            {
+                "index": spec["index"],
+                "filename": name,
+                "offset": spec["offset"],
+                "size": spec["size"],
+                "sha256": "",
+            }
+        )
+
+    manifest = build_manifest(
+        original_filename=base_name,
+        total_size=size,
+        sha256=sha256,
+        chunk_size=chunk_size,
+        chunks=chunk_records,
+        mega_path=None,
+        mtime_utc=None,
+        capture_datetime=None,
+        capture_datetime_source=None,
+    )
+    manifest_message = await service.upload_bytes(
+        json.dumps(manifest, indent=2).encode(),
+        file_name=manifest_name(base_name),
+        caption=build_manifest_caption(rel_path, original_filename=base_name),
+    )
+    return manifest_message, count, chunk_messages
