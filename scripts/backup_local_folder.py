@@ -7,9 +7,12 @@ Design: docs/superpowers/specs/2026-07-30-iphone-backup-telegram-design.md
 from __future__ import annotations
 
 import logging
+import os
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
+
+from pyrogram import Client
 
 logger = logging.getLogger("backup_local_folder")
 
@@ -118,3 +121,40 @@ def failed_rows(conn: sqlite3.Connection) -> list[tuple[str, str]]:
         "SELECT rel_path, error FROM files WHERE status = 'FAILED' ORDER BY rel_path"
     ).fetchall()
     return [(rel_path, error or "") for rel_path, error in rows]
+
+
+def _required_env(name: str) -> str:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        raise RuntimeError(f"Missing required environment variable: {name}")
+    return value.strip()
+
+
+def _optional_env(name: str) -> str | None:
+    value = os.getenv(name)
+    if value is None:
+        return None
+    cleaned = value.strip()
+    return cleaned or None
+
+
+def build_client() -> Client:
+    kwargs: dict[str, object] = {
+        "name": "iphone_backup_migration",
+        "api_id": int(_required_env("TELEGRAM_API_ID")),
+        "api_hash": _required_env("TELEGRAM_API_HASH"),
+        "sleep_threshold": int(os.getenv("TELEGRAM_SLEEP_THRESHOLD", "60")),
+    }
+    session_string = _optional_env("TELEGRAM_SESSION_STRING")
+    if session_string:
+        kwargs["session_string"] = session_string
+    return Client(**kwargs)
+
+
+async def get_or_create_channel_id(client, conn: sqlite3.Connection) -> int:
+    existing = get_meta(conn, "channel_id")
+    if existing is not None:
+        return int(existing)
+    channel = await client.create_channel(CHANNEL_TITLE)
+    set_meta(conn, "channel_id", str(channel.id))
+    return channel.id

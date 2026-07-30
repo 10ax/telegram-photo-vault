@@ -1,8 +1,12 @@
 from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
 
 from scripts.backup_local_folder import (
     failed_rows,
     get_meta,
+    get_or_create_channel_id,
     get_row,
     open_state_db,
     pending_rel_paths,
@@ -91,3 +95,36 @@ def test_meta_roundtrip_and_overwrite(tmp_path):
     assert get_meta(conn, "channel_id") == "-1001234567890"
     set_meta(conn, "channel_id", "-1009999999999")
     assert get_meta(conn, "channel_id") == "-1009999999999"
+
+
+class FakeChannelClient:
+    def __init__(self):
+        self.create_channel_calls = []
+
+    async def create_channel(self, title):
+        self.create_channel_calls.append(title)
+        return SimpleNamespace(id=-1009999999999)
+
+
+@pytest.mark.asyncio
+async def test_get_or_create_channel_id_creates_once(tmp_path):
+    conn = open_state_db(tmp_path / "state.db")
+    client = FakeChannelClient()
+
+    channel_id = await get_or_create_channel_id(client, conn)
+
+    assert channel_id == -1009999999999
+    assert client.create_channel_calls == ["iPhone Backup Archive"]
+    assert get_meta(conn, "channel_id") == "-1009999999999"
+
+
+@pytest.mark.asyncio
+async def test_get_or_create_channel_id_reuses_stored_id(tmp_path):
+    conn = open_state_db(tmp_path / "state.db")
+    set_meta(conn, "channel_id", "-1001111111111")
+    client = FakeChannelClient()
+
+    channel_id = await get_or_create_channel_id(client, conn)
+
+    assert channel_id == -1001111111111
+    assert client.create_channel_calls == []
