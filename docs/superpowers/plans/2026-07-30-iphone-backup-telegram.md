@@ -953,6 +953,31 @@ async def test_process_file_chunked_path_verifies_end_to_end(tmp_path):
     assert row["manifest_tg_message_id"] is not None
 
 
+async def test_process_file_retries_a_previously_failed_row(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "IMG_0003.HEIC").write_bytes(b"z" * 100)
+    conn = open_state_db(tmp_path / "state.db")
+    scan_folder(conn, source)
+    # Simulate a row left FAILED by a prior run (e.g. a transient network error) —
+    # stale sha256/tg_message_id from a step that never actually completed.
+    set_status(
+        conn, "IMG_0003.HEIC", "FAILED", sha256="stale", tg_message_id=999,
+        error="Connection reset by peer",
+    )
+    client = FakeFullClient()
+    service = FakeFullService(client)
+
+    await process_file(
+        client, service, conn, source, "IMG_0003.HEIC", client.channel_id,
+        chunk_threshold=1_000_000, chunk_size=500_000, tmp_verify_dir=tmp_path / "verify",
+    )
+
+    row = get_row(conn, "IMG_0003.HEIC")
+    assert row["status"] == "VERIFIED"
+    assert row["error"] is None
+
+
 async def test_main_scan_only_reports_without_touching_telegram(tmp_path, monkeypatch, capsys):
     source = tmp_path / "source"
     source.mkdir()
@@ -1016,6 +1041,17 @@ async def process_file(
     size = row["size"]
     sha256 = row["sha256"]
     tg_message_id = row["tg_message_id"]
+
+    if status == "FAILED":
+        # The design's resumability contract is "any row not already VERIFIED is
+        # retried" — pending_rel_paths() already includes FAILED rows, but nothing
+        # upstream re-derives which step to resume from a failure (unlike the
+        # production app's separate failed_status column). Restarting the whole
+        # per-file pipeline is simple, correct, and cheap enough at this dataset's
+        # scale (a handful of transient failures out of thousands of files, not a
+        # systematic pattern) — the alternative (tracking exactly which step failed)
+        # isn't justified by the size of the problem it would solve here.
+        status = "PENDING"
 
     try:
         if status == "PENDING":
@@ -1151,7 +1187,7 @@ if __name__ == "__main__":
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `cd /home/tenax/Personal/code/telegram-photo-vault && .venv/bin/python -m pytest tests/test_backup_local_folder.py -v`
-Expected: PASS (17 tests).
+Expected: PASS (18 tests).
 
 - [ ] **Step 5: Run the full test suite to confirm nothing else broke**
 
