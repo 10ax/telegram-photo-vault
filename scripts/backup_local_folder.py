@@ -6,6 +6,8 @@ Design: docs/superpowers/specs/2026-07-30-iphone-backup-telegram-design.md
 """
 from __future__ import annotations
 
+import argparse
+import asyncio
 import hashlib
 import json
 import logging
@@ -15,6 +17,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from pyrogram import Client
+from pyrogram.errors import FloodWait
 
 from app.services.chunking import (
     ChunkWindow,
@@ -26,6 +29,7 @@ from app.services.chunking import (
     manifest_name,
     plan_chunks,
 )
+from app.services.telegram import TelegramService
 
 logger = logging.getLogger("backup_local_folder")
 
@@ -285,3 +289,163 @@ async def verify_chunked(client, chunk_messages: list, expected_sha256: str, tmp
         finally:
             tmp_path.unlink(missing_ok=True)
     return hasher.hexdigest() == expected_sha256
+
+
+async def process_file(
+    client,
+    service,
+    conn: sqlite3.Connection,
+    source_root: Path,
+    rel_path: str,
+    channel_id: int,
+    chunk_threshold: int,
+    chunk_size: int,
+    tmp_verify_dir: Path,
+) -> None:
+    row = get_row(conn, rel_path)
+    abs_path = source_root / rel_path
+    status = row["status"]
+    size = row["size"]
+    sha256 = row["sha256"]
+    tg_message_id = row["tg_message_id"]
+
+    try:
+        # Ensure the verify scratch dir exists before any verify_* call needs to write
+        # into it. Cheap and idempotent, so doing it per-file (rather than once in
+        # main()) also makes process_file callable standalone, as the tests do.
+        tmp_verify_dir.mkdir(parents=True, exist_ok=True)
+
+        if status == "PENDING":
+            sha256, _ = compute_hashes(abs_path, chunk_size)
+            set_status(conn, rel_path, "HASHED", sha256=sha256)
+            status = "HASHED"
+
+        if status == "HASHED":
+            if size > chunk_threshold:
+                # Recomputed rather than threaded from the PENDING branch above: a run
+                # resumed after a crash enters here with status already HASHED (no
+                # PENDING step this call), so chunk_hashes must be derived fresh either
+                # way. The extra pass over the file only affects the handful of files
+                # above chunk_threshold, and is negligible next to their upload+verify
+                # time.
+                _, chunk_hashes = compute_hashes(abs_path, chunk_size)
+                manifest_message, count, chunk_messages = await upload_chunked(
+                    service, abs_path, rel_path, size, sha256, chunk_size, chunk_hashes
+                )
+                ok = await verify_chunked(client, chunk_messages, sha256, tmp_verify_dir)
+                set_status(
+                    conn,
+                    rel_path,
+                    "VERIFIED" if ok else "FAILED",
+                    is_chunked=1,
+                    chunk_count=count,
+                    manifest_tg_message_id=manifest_message.id,
+                    error=None if ok else "hash mismatch on verify (chunked)",
+                )
+                return
+
+            tg_message_id = await upload_single(service, abs_path, rel_path, size, sha256)
+            set_status(conn, rel_path, "UPLOADED", tg_message_id=tg_message_id)
+            status = "UPLOADED"
+
+        if status == "UPLOADED":
+            ok = await verify_single(client, channel_id, tg_message_id, sha256, tmp_verify_dir)
+            set_status(
+                conn,
+                rel_path,
+                "VERIFIED" if ok else "FAILED",
+                error=None if ok else "hash mismatch on verify",
+            )
+    except FloodWait:
+        # Longer than the client's sleep_threshold — propagate and end the run rather
+        # than mark this (and every subsequent) file FAILED against a rate limit that
+        # hasn't cleared yet. Rerun resumes cleanly from the DB state.
+        raise
+    except Exception as exc:  # one bad file must never stop the run
+        logger.exception("failed processing %s", rel_path)
+        set_status(conn, rel_path, "FAILED", error=str(exc))
+
+
+def print_report(conn: sqlite3.Connection) -> None:
+    counts = status_counts(conn)
+    print(" ".join(f"{status}: {count}" for status, count in sorted(counts.items())))
+    channel_id = get_meta(conn, "channel_id")
+    if channel_id:
+        print(f"Channel: {channel_id}")
+    failures = failed_rows(conn)
+    if failures:
+        print("Failed files:")
+        for rel_path, error in failures:
+            print(f"  {rel_path} — {error}")
+
+
+async def main(argv=None) -> None:
+    parser = argparse.ArgumentParser(
+        description="Migrate a local folder to a new, dedicated Telegram channel."
+    )
+    parser.add_argument("--source", default="/backup-source")
+    parser.add_argument("--state-db", default="/data/iphone_backup_state.db")
+    parser.add_argument("--tmp-verify-dir", default="/data/tmp-verify")
+    parser.add_argument(
+        "--delay", type=float, default=float(os.getenv("TELEGRAM_UPLOAD_DELAY", "5"))
+    )
+    parser.add_argument(
+        "--chunk-threshold",
+        type=int,
+        default=int(os.getenv("CHUNK_THRESHOLD", str(DEFAULT_CHUNK_THRESHOLD))),
+    )
+    parser.add_argument(
+        "--chunk-size", type=int, default=int(os.getenv("CHUNK_SIZE", str(DEFAULT_CHUNK_SIZE)))
+    )
+    parser.add_argument(
+        "--scan-only",
+        action="store_true",
+        help="Scan and report counts without connecting to Telegram",
+    )
+    args = parser.parse_args(argv)
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
+
+    source_root = Path(args.source)
+    tmp_verify_dir = Path(args.tmp_verify_dir)
+
+    conn = open_state_db(Path(args.state_db))
+    inserted = scan_folder(conn, source_root)
+    logger.info("scan complete: %d new file(s) tracked", inserted)
+
+    if args.scan_only:
+        print_report(conn)
+        return
+
+    # Deferred until past the scan-only early-return: --scan-only must not touch the
+    # filesystem beyond --state-db, even when --tmp-verify-dir is left at its
+    # /data-rooted default. process_file() creates it again per-file regardless
+    # (needed there since resumed/direct calls don't go through main() at all); the
+    # call here just fails fast before opening the Telegram client.
+    tmp_verify_dir.mkdir(parents=True, exist_ok=True)
+
+    client = build_client()
+    try:
+        async with client:
+            channel_id = await get_or_create_channel_id(client, conn)
+            service = TelegramService(client, channel_id, upload_delay_seconds=args.delay)
+
+            for rel_path in pending_rel_paths(conn):
+                await process_file(
+                    client,
+                    service,
+                    conn,
+                    source_root,
+                    rel_path,
+                    channel_id,
+                    args.chunk_threshold,
+                    args.chunk_size,
+                    tmp_verify_dir,
+                )
+    finally:
+        # Always report — on a clean finish, a long FloodWait abort, or Ctrl-C.
+        print_report(conn)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

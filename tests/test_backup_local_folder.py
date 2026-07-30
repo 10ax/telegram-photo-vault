@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -278,3 +279,141 @@ async def test_verify_chunked_hashes_parts_in_order(tmp_path):
 
     assert ok is True
     assert list(tmp_path.iterdir()) == []
+
+
+from scripts.backup_local_folder import main, process_file
+
+
+class FakeFullClient:
+    """Combined fake covering channel creation, upload, and verify-download."""
+
+    def __init__(self):
+        self.channel_id = -1005555555555
+        self.messages = {}
+        self.next_id = 900
+        self.corrupt_message_ids = set()
+
+    async def create_channel(self, title):
+        return SimpleNamespace(id=self.channel_id)
+
+    async def get_messages(self, chat_id, message_id):
+        return SimpleNamespace(id=message_id)
+
+    async def download_media(self, message, file_name):
+        payload = self.messages[message.id]
+        if message.id in self.corrupt_message_ids:
+            payload = payload[:-1] + b"\x00"
+        Path(file_name).write_bytes(payload)
+
+
+class FakeFullService:
+    def __init__(self, client):
+        self.client = client
+
+    async def upload_document(self, file_path, *, caption=None, file_name=None):
+        data = Path(file_path).read_bytes()
+        self.client.next_id += 1
+        self.client.messages[self.client.next_id] = data
+        return SimpleNamespace(id=self.client.next_id)
+
+    async def upload_file_object(self, file_object, caption):
+        data = file_object.read()
+        self.client.next_id += 1
+        self.client.messages[self.client.next_id] = data
+        return SimpleNamespace(id=self.client.next_id)
+
+    async def upload_bytes(self, data, *, file_name, caption):
+        self.client.next_id += 1
+        self.client.messages[self.client.next_id] = data
+        return SimpleNamespace(id=self.client.next_id)
+
+
+async def test_process_file_uploads_and_verifies_small_file(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "IMG_0001.HEIC").write_bytes(b"x" * 100)
+    conn = open_state_db(tmp_path / "state.db")
+    scan_folder(conn, source)
+    client = FakeFullClient()
+    service = FakeFullService(client)
+
+    await process_file(
+        client, service, conn, source, "IMG_0001.HEIC", client.channel_id,
+        chunk_threshold=1_000_000, chunk_size=500_000, tmp_verify_dir=tmp_path / "verify",
+    )
+
+    row = get_row(conn, "IMG_0001.HEIC")
+    assert row["status"] == "VERIFIED"
+    assert row["tg_message_id"] is not None
+
+
+async def test_process_file_marks_failed_on_verify_mismatch(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "IMG_0002.HEIC").write_bytes(b"y" * 100)
+    conn = open_state_db(tmp_path / "state.db")
+    scan_folder(conn, source)
+    client = FakeFullClient()
+    service = FakeFullService(client)
+
+    async def upload_then_corrupt(file_path, *, caption=None, file_name=None):
+        data = Path(file_path).read_bytes()
+        client.next_id += 1
+        client.messages[client.next_id] = data
+        client.corrupt_message_ids.add(client.next_id)
+        return SimpleNamespace(id=client.next_id)
+
+    service.upload_document = upload_then_corrupt
+
+    await process_file(
+        client, service, conn, source, "IMG_0002.HEIC", client.channel_id,
+        chunk_threshold=1_000_000, chunk_size=500_000, tmp_verify_dir=tmp_path / "verify",
+    )
+
+    row = get_row(conn, "IMG_0002.HEIC")
+    assert row["status"] == "FAILED"
+    assert row["error"] == "hash mismatch on verify"
+
+
+async def test_process_file_chunked_path_verifies_end_to_end(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "IMG_7023.MOV").write_bytes(os.urandom(10_000))
+    conn = open_state_db(tmp_path / "state.db")
+    scan_folder(conn, source)
+    client = FakeFullClient()
+    service = FakeFullService(client)
+
+    await process_file(
+        client, service, conn, source, "IMG_7023.MOV", client.channel_id,
+        chunk_threshold=4_000, chunk_size=4_000, tmp_verify_dir=tmp_path / "verify",
+    )
+
+    row = get_row(conn, "IMG_7023.MOV")
+    assert row["status"] == "VERIFIED"
+    assert row["is_chunked"] == 1
+    assert row["chunk_count"] == 3
+    assert row["manifest_tg_message_id"] is not None
+
+
+async def test_main_scan_only_reports_without_touching_telegram(tmp_path, monkeypatch, capsys):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "a.jpg").write_bytes(b"1")
+    (source / "b.jpg").write_bytes(b"2")
+
+    def _fail_build_client():
+        raise AssertionError("build_client must not be called in --scan-only mode")
+
+    monkeypatch.setattr("scripts.backup_local_folder.build_client", _fail_build_client)
+
+    await main(
+        [
+            "--source", str(source),
+            "--state-db", str(tmp_path / "state.db"),
+            "--scan-only",
+        ]
+    )
+
+    out = capsys.readouterr().out
+    assert "PENDING: 2" in out
