@@ -228,3 +228,53 @@ async def test_upload_chunked_splits_uploads_and_builds_manifest(tmp_path):
         assert spec["sha256"] != ""
     assert "107APPLE/IMG_7023.MOV" in service.chunk_captions["IMG_7023.MOV.part001-of-003"]
     assert "107APPLE/IMG_7023.MOV" in service.manifest_caption
+
+
+from scripts.backup_local_folder import verify_chunked, verify_single
+
+
+class FakeDownloadClient:
+    def __init__(self, payloads_by_message_id):
+        self.payloads = payloads_by_message_id
+        self.get_messages_calls = []
+
+    async def get_messages(self, chat_id, message_id):
+        self.get_messages_calls.append((chat_id, message_id))
+        return SimpleNamespace(id=message_id)
+
+    async def download_media(self, message, file_name):
+        Path(file_name).write_bytes(self.payloads[message.id])
+
+
+@pytest.mark.asyncio
+async def test_verify_single_matches_expected_hash(tmp_path):
+    data = b"hello world"
+    client = FakeDownloadClient({42: data})
+
+    ok = await verify_single(client, -100123, 42, hashlib.sha256(data).hexdigest(), tmp_path)
+
+    assert ok is True
+    assert client.get_messages_calls == [(-100123, 42)]
+    assert list(tmp_path.iterdir()) == []  # temp file cleaned up
+
+
+@pytest.mark.asyncio
+async def test_verify_single_detects_mismatch(tmp_path):
+    client = FakeDownloadClient({42: b"corrupted"})
+
+    ok = await verify_single(client, -100123, 42, hashlib.sha256(b"original").hexdigest(), tmp_path)
+
+    assert ok is False
+
+
+@pytest.mark.asyncio
+async def test_verify_chunked_hashes_parts_in_order(tmp_path):
+    part1, part2 = b"first-part-bytes", b"second-part-bytes"
+    client = FakeDownloadClient({1: part1, 2: part2})
+    chunk_messages = [SimpleNamespace(id=1), SimpleNamespace(id=2)]
+    expected = hashlib.sha256(part1 + part2).hexdigest()
+
+    ok = await verify_chunked(client, chunk_messages, expected, tmp_path)
+
+    assert ok is True
+    assert list(tmp_path.iterdir()) == []

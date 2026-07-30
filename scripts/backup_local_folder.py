@@ -6,6 +6,7 @@ Design: docs/superpowers/specs/2026-07-30-iphone-backup-telegram-design.md
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -243,3 +244,37 @@ async def upload_chunked(
         caption=build_manifest_caption(rel_path, original_filename=base_name),
     )
     return manifest_message, count, chunk_messages
+
+
+_HASH_BLOCK_SIZE = 4 * 1024 * 1024
+
+
+async def _download_and_hash(client, message, tmp_dir: Path) -> str:
+    tmp_path = tmp_dir / f"verify_{message.id}"
+    await client.download_media(message, file_name=str(tmp_path))
+    hasher = hashlib.sha256()
+    with open(tmp_path, "rb") as handle:
+        for block in iter(lambda: handle.read(_HASH_BLOCK_SIZE), b""):
+            hasher.update(block)
+    tmp_path.unlink()
+    return hasher.hexdigest()
+
+
+async def verify_single(
+    client, channel_id: int, message_id: int, expected_sha256: str, tmp_dir: Path
+) -> bool:
+    message = await client.get_messages(channel_id, message_id)
+    digest = await _download_and_hash(client, message, tmp_dir)
+    return digest == expected_sha256
+
+
+async def verify_chunked(client, chunk_messages: list, expected_sha256: str, tmp_dir: Path) -> bool:
+    hasher = hashlib.sha256()
+    for message in chunk_messages:
+        tmp_path = tmp_dir / f"verify_{message.id}"
+        await client.download_media(message, file_name=str(tmp_path))
+        with open(tmp_path, "rb") as handle:
+            for block in iter(lambda: handle.read(_HASH_BLOCK_SIZE), b""):
+                hasher.update(block)
+        tmp_path.unlink()
+    return hasher.hexdigest() == expected_sha256
