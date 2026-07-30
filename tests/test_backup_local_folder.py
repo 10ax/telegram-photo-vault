@@ -167,6 +167,7 @@ async def test_upload_single_calls_service_and_returns_message_id(tmp_path):
 import hashlib
 import json
 
+from app.services.chunking import compute_hashes
 from scripts.backup_local_folder import upload_chunked
 
 
@@ -197,10 +198,12 @@ async def test_upload_chunked_splits_uploads_and_builds_manifest(tmp_path):
     abs_path = tmp_path / "IMG_7023.MOV"
     abs_path.write_bytes(data)
     sha256 = hashlib.sha256(data).hexdigest()
+    chunk_size = 4_000
+    _, chunk_hashes = compute_hashes(abs_path, chunk_size)
     service = FakeChunkService()
 
     manifest_message, count, chunk_messages = await upload_chunked(
-        service, abs_path, "107APPLE/IMG_7023.MOV", len(data), sha256, chunk_size=4_000
+        service, abs_path, "107APPLE/IMG_7023.MOV", len(data), sha256, chunk_size, chunk_hashes
     )
 
     assert count == 3
@@ -217,5 +220,11 @@ async def test_upload_chunked_splits_uploads_and_builds_manifest(tmp_path):
     assert joined == data
     assert service.manifest_payload["sha256"] == sha256
     assert service.manifest_payload["chunk_count"] == 3
+    # Per-chunk hashes in the manifest must be real (this is what scripts/vault_merge.py
+    # verifies against before it will merge parts back into the original file).
+    for spec in service.manifest_payload["chunks"]:
+        expected = chunk_hashes[spec["index"] - 1]
+        assert spec["sha256"] == expected
+        assert spec["sha256"] != ""
     assert "107APPLE/IMG_7023.MOV" in service.chunk_captions["IMG_7023.MOV.part001-of-003"]
     assert "107APPLE/IMG_7023.MOV" in service.manifest_caption

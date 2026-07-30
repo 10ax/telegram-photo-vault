@@ -186,7 +186,13 @@ async def upload_single(service, abs_path: Path, rel_path: str, size: int, sha25
 
 
 async def upload_chunked(
-    service, abs_path: Path, rel_path: str, size: int, sha256: str, chunk_size: int
+    service,
+    abs_path: Path,
+    rel_path: str,
+    size: int,
+    sha256: str,
+    chunk_size: int,
+    chunk_hashes: list[str],
 ):
     base_name = Path(rel_path).name
     plan = plan_chunks(size, chunk_size)
@@ -216,7 +222,7 @@ async def upload_chunked(
                 "filename": name,
                 "offset": spec["offset"],
                 "size": spec["size"],
-                "sha256": "",
+                "sha256": chunk_hashes[spec["index"] - 1],
             }
         )
 
