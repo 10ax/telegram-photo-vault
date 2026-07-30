@@ -1212,17 +1212,28 @@ Telegram account and the real source folder. Do not skip the dry-run smoke test
 
 **Files:** none (execution only).
 
+**Note on the commands below (post-final-review):** invocation is `-m scripts.backup_local_folder`,
+not `scripts/backup_local_folder.py` — the latter never finds the `app` package (`WORKDIR /app`
+never lands on `sys.path` for a plain script invocation), a bug the final whole-branch review
+caught before any real run. The smoke test also uses its own `--state-db`/`--tmp-verify-dir` from
+the start, so nothing needs to be deleted afterward (an earlier version of this step deleted the
+real state DB, which would have orphaned the smoke-test channel and pointed the real run at a
+freshly-created second channel).
+
 - [ ] **Step 1: Build a throwaway 2-file test folder and dry-run the scan**
 
 ```bash
 mkdir -p /tmp/backup-smoke-test/100APPLE
 head -c 1000 /dev/urandom > /tmp/backup-smoke-test/100APPLE/test1.jpg
 head -c 5000000 /dev/urandom > /tmp/backup-smoke-test/100APPLE/test2.mov
+mkdir -p /tmp/backup-smoke-test-data
 cd /home/tenax/Personal/code/telegram-photo-vault
 docker compose run --rm --entrypoint python \
   -v "/tmp/backup-smoke-test:/backup-source:ro" \
+  -v "/tmp/backup-smoke-test-data:/smoke-data" \
   -v "$(pwd)/scripts:/app/scripts:ro" \
-  telegram-photo-vault scripts/backup_local_folder.py --scan-only
+  telegram-photo-vault -m scripts.backup_local_folder \
+  --state-db /smoke-data/state.db --tmp-verify-dir /smoke-data/tmp-verify --scan-only
 ```
 
 Expected output: `PENDING: 2` and no channel line (nothing created yet in scan-only mode).
@@ -1233,24 +1244,27 @@ Expected output: `PENDING: 2` and no channel line (nothing created yet in scan-o
 cd /home/tenax/Personal/code/telegram-photo-vault
 docker compose run --rm --entrypoint python \
   -v "/tmp/backup-smoke-test:/backup-source:ro" \
+  -v "/tmp/backup-smoke-test-data:/smoke-data" \
   -v "$(pwd)/scripts:/app/scripts:ro" \
-  telegram-photo-vault scripts/backup_local_folder.py
+  telegram-photo-vault -m scripts.backup_local_folder \
+  --state-db /smoke-data/state.db --tmp-verify-dir /smoke-data/tmp-verify
 ```
 
-Expected output: `VERIFIED: 2` and a `Channel: -100...` line. Open Telegram and confirm
-the "iPhone Backup Archive" channel exists with 2 documents captioned
-`100APPLE/test1.jpg\n...` and `100APPLE/test2.mov\n...`.
+Expected output includes `VERIFIED: 2`, a `Channel: -100...` line, and
+`SAFE TO DELETE: 2/2 files VERIFIED.`. Open Telegram and confirm the "iPhone Backup
+Archive" channel exists with 2 documents captioned `100APPLE/test1.jpg\n...` and
+`100APPLE/test2.mov\n...`.
 
-- [ ] **Step 3: Note the created channel id, then clean up the smoke test's local state**
+- [ ] **Step 3: Note the channel id, then clean up the throwaway smoke-test folder**
 
-The channel id printed in Step 2 is now the *real* backup channel — record it (e.g. in
-your own notes; nothing in this repo needs it, since the script re-reads it from
-`/data/iphone_backup_state.db` on every run). Remove the throwaway smoke-test state so
-it doesn't linger in the same DB as the real migration:
+The channel id printed in Step 2 is the *real* backup channel — record it. The real
+run (Steps 4-5) creates its own state DB from scratch and will call `create_channel`
+again, making a **second** channel, unless you seed it explicitly. Every real-run
+command below therefore includes `--channel-id <id-from-step-2>` — replace it with the
+actual value before running.
 
 ```bash
-rm -f /home/tenax/Personal/code/telegram-photo-vault/data/iphone_backup_state.db
-rm -rf /tmp/backup-smoke-test
+rm -rf /tmp/backup-smoke-test /tmp/backup-smoke-test-data
 ```
 
 - [ ] **Step 4: Scan-only against the real folder to confirm the file count**
@@ -1260,30 +1274,42 @@ cd /home/tenax/Personal/code/telegram-photo-vault
 docker compose run --rm --entrypoint python \
   -v "/home/tenax/Pictures/iPhone backup:/backup-source:ro" \
   -v "$(pwd)/scripts:/app/scripts:ro" \
-  telegram-photo-vault scripts/backup_local_folder.py --scan-only
+  telegram-photo-vault -m scripts.backup_local_folder --scan-only
 ```
 
 Expected output: `PENDING: 6916` (matches the count established during investigation).
+If instead you see `NOT SAFE TO DELETE: 0 files tracked.` plus a `SystemExit`, the
+`-v` source mount is wrong (check the path and quoting around the space in
+`"iPhone Backup"`) — the script now refuses to silently report success against an
+empty or misconfigured source, so this failing loudly here is correct behavior, not a
+bug.
 
 - [ ] **Step 5: Run the real migration in the background**
 
 This will take many hours (106 GB uploaded, then re-downloaded for verification, at a
-conservative pace). Run it detached so it survives a closed terminal:
+conservative pace). Run it detached so it survives a closed terminal. Replace
+`<channel-id>` with the value recorded in Step 3:
 
 ```bash
 cd /home/tenax/Personal/code/telegram-photo-vault
 nohup docker compose run --rm --entrypoint python \
   -v "/home/tenax/Pictures/iPhone backup:/backup-source:ro" \
   -v "$(pwd)/scripts:/app/scripts:ro" \
-  telegram-photo-vault scripts/backup_local_folder.py \
+  telegram-photo-vault -m scripts.backup_local_folder --channel-id <channel-id> \
   > /home/tenax/Personal/code/telegram-photo-vault/local-data/backup-run.log 2>&1 &
 disown
 ```
 
+`--channel-id` only needs to be passed once — it seeds `meta.channel_id` in the state
+DB, and every subsequent rerun (including retries) reads it back from there
+automatically, so it's safe to keep passing it or drop it on later reruns.
+
 - [ ] **Step 6: Check progress at any time without disturbing the run**
 
 The state DB is a plain SQLite file on the host at `./data/iphone_backup_state.db`
-(read-only queries are safe to run concurrently):
+(read-only queries are safe to run concurrently). The run also now logs one line per
+file (`[i/total] rel_path`) as it goes, so a silent log for more than a few minutes at
+a time is itself a signal something is stuck:
 
 ```bash
 sqlite3 /home/tenax/Personal/code/telegram-photo-vault/data/iphone_backup_state.db \
@@ -1291,14 +1317,22 @@ sqlite3 /home/tenax/Personal/code/telegram-photo-vault/data/iphone_backup_state.
 tail -f /home/tenax/Personal/code/telegram-photo-vault/local-data/backup-run.log
 ```
 
-- [ ] **Step 7: When the run finishes, confirm zero failures before deleting anything**
+- [ ] **Step 7: When the run finishes, check the report's explicit verdict before deleting anything**
+
+The script's final report line is the gate — check the tail of the run log, or query
+directly:
 
 ```bash
-sqlite3 /home/tenax/Personal/code/telegram-photo-vault/data/iphone_backup_state.db \
-  "SELECT rel_path, error FROM files WHERE status = 'FAILED';"
+tail -20 /home/tenax/Personal/code/telegram-photo-vault/local-data/backup-run.log
 ```
 
-If that query returns no rows, every file is `VERIFIED` and it is safe to manually
-delete `/home/tenax/Pictures/iPhone backup/` to reclaim the 106 GB. If it returns rows,
-re-run the same Step 5 command — the script only retries files not already `VERIFIED`
-and will pick those failures back up from `HASHED`.
+Only proceed to delete `/home/tenax/Pictures/iPhone backup/` if the last line reads
+`SAFE TO DELETE: 6916/6916 files VERIFIED.` — the exact total for *this* folder, not
+just "no FAILED rows" (a run that was interrupted mid-way, e.g. by a long FloodWait,
+will show a `NOT SAFE TO DELETE: N/6916 file(s) not VERIFIED yet.` line with zero
+`FAILED` rows too, since the remaining files are still `PENDING`/`HASHED`/`UPLOADED`,
+not `FAILED` — this is exactly the false-positive the final review caught and the new
+verdict line exists to prevent). If it says `NOT SAFE`, re-run the same Step 5 command
+— the script retries everything not already `VERIFIED`, including rows left `FAILED`
+by a prior run (reset to start over from scratch for that file) and rows simply not
+reached yet.
