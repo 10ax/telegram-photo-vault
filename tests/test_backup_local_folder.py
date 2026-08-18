@@ -421,6 +421,57 @@ async def test_process_file_retries_a_previously_failed_row(tmp_path):
     assert row["error"] is None
 
 
+async def test_process_file_skip_verify_marks_verified_without_download(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "IMG_0004.HEIC").write_bytes(b"w" * 100)
+    conn = open_state_db(tmp_path / "state.db")
+    scan_folder(conn, source)
+    client = FakeFullClient()
+    service = FakeFullService(client)
+
+    async def _fail_download(message, file_name):
+        raise AssertionError("download_media must not be called when skip_verify=True")
+
+    client.download_media = _fail_download
+
+    await process_file(
+        client, service, conn, source, "IMG_0004.HEIC", client.channel_id,
+        chunk_threshold=1_000_000, chunk_size=500_000, tmp_verify_dir=tmp_path / "verify",
+        skip_verify=True,
+    )
+
+    row = get_row(conn, "IMG_0004.HEIC")
+    assert row["status"] == "VERIFIED"
+    assert row["tg_message_id"] is not None
+
+
+async def test_process_file_skip_verify_chunked_marks_verified_without_download(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "IMG_7024.MOV").write_bytes(os.urandom(10_000))
+    conn = open_state_db(tmp_path / "state.db")
+    scan_folder(conn, source)
+    client = FakeFullClient()
+    service = FakeFullService(client)
+
+    async def _fail_download(message, file_name):
+        raise AssertionError("download_media must not be called when skip_verify=True")
+
+    client.download_media = _fail_download
+
+    await process_file(
+        client, service, conn, source, "IMG_7024.MOV", client.channel_id,
+        chunk_threshold=4_000, chunk_size=4_000, tmp_verify_dir=tmp_path / "verify",
+        skip_verify=True,
+    )
+
+    row = get_row(conn, "IMG_7024.MOV")
+    assert row["status"] == "VERIFIED"
+    assert row["is_chunked"] == 1
+    assert row["chunk_count"] == 3
+
+
 async def test_main_scan_only_reports_without_touching_telegram(tmp_path, monkeypatch, capsys):
     source = tmp_path / "source"
     source.mkdir()

@@ -301,6 +301,7 @@ async def process_file(
     chunk_threshold: int,
     chunk_size: int,
     tmp_verify_dir: Path,
+    skip_verify: bool = False,
 ) -> None:
     row = get_row(conn, rel_path)
     abs_path = source_root / rel_path
@@ -343,7 +344,14 @@ async def process_file(
                 manifest_message, count, chunk_messages = await upload_chunked(
                     service, abs_path, rel_path, size, sha256, chunk_size, chunk_hashes
                 )
-                ok = await verify_chunked(client, chunk_messages, sha256, tmp_verify_dir)
+                # skip_verify trusts the upload and skips the re-download+hash pass —
+                # it halves Telegram traffic per file, at the cost of not catching a
+                # corrupted upload until someone opens the file later.
+                ok = (
+                    True
+                    if skip_verify
+                    else await verify_chunked(client, chunk_messages, sha256, tmp_verify_dir)
+                )
                 set_status(
                     conn,
                     rel_path,
@@ -356,10 +364,16 @@ async def process_file(
                 return
 
             tg_message_id = await upload_single(service, abs_path, rel_path, size, sha256)
+            if skip_verify:
+                set_status(conn, rel_path, "VERIFIED", tg_message_id=tg_message_id)
+                return
             set_status(conn, rel_path, "UPLOADED", tg_message_id=tg_message_id)
             status = "UPLOADED"
 
         if status == "UPLOADED":
+            if skip_verify:
+                set_status(conn, rel_path, "VERIFIED")
+                return
             ok = await verify_single(client, channel_id, tg_message_id, sha256, tmp_verify_dir)
             set_status(
                 conn,
@@ -427,6 +441,12 @@ async def main(argv=None) -> None:
         default=None,
         help="Adopt an existing channel instead of creating a new one (seeds meta.channel_id)",
     )
+    parser.add_argument(
+        "--skip-verify",
+        action="store_true",
+        help="Trust each upload and skip the re-download+hash verify pass (faster, "
+        "less Telegram traffic, no corruption check)",
+    )
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
@@ -486,6 +506,7 @@ async def main(argv=None) -> None:
                     args.chunk_threshold,
                     args.chunk_size,
                     tmp_verify_dir,
+                    skip_verify=args.skip_verify,
                 )
     finally:
         # Always report — on a clean finish, a long FloodWait abort, or Ctrl-C.
