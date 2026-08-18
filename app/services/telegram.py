@@ -137,6 +137,12 @@ class TelegramService:
             document=str(path),
             caption=caption,
             file_name=file_name,
+            # Never let Telegram interpret the payload: without this it recognises
+            # GIFs and short soundless mp4s (Pixel/Samsung motion photos) as
+            # animations, transcodes them — losing the original bytes, so the
+            # archive no longer matches its sha256 — and auto-adds each one to the
+            # account's saved-GIFs library. Both happened before this was set.
+            force_document=True,
         )
 
         if self.upload_delay_seconds > 0:
@@ -150,6 +156,9 @@ class TelegramService:
             document=file_object,
             caption=caption,
             file_name=file_object.name,
+            # Same reason as upload_document: chunk parts and manifests must land
+            # as untouched bytes, whatever their extension looks like.
+            force_document=True,
         )
 
         if self.upload_delay_seconds > 0:
