@@ -5,6 +5,10 @@ on:
     branches: ["**"]
   pull_request:
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -21,6 +25,9 @@ jobs:
 
       - name: Compile check
         run: python -m compileall -q app scripts
+
+      - name: Lint
+        run: ruff check .
 
       - name: Run tests
         run: pytest -q

@@ -2,7 +2,6 @@
 from datetime import datetime
 from types import SimpleNamespace
 
-import pytest
 from sqlalchemy import select
 
 from app.models.database import AsyncSessionLocal, RecoveryItem, RecoveryStatus

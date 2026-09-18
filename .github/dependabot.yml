@@ -1,0 +1,10 @@
+version: 2
+updates:
+  # Only the workflow actions. Python dependency bumps stay the owner's call:
+  # kurigram, Pillow and pillow-heif pin behaviour this archive depends on.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "ci"

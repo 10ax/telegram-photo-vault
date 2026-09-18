@@ -1,0 +1,11 @@
+# Deliberately narrow: this linter is an error-finder, not a formatter.
+#
+# Only pyflakes (F: undefined names, unused imports/variables, f-string and
+# format bugs) and pycodestyle's E9 group (syntax / IO errors) are enabled, so
+# `ruff check .` passes on the codebase exactly as it stands — no reformatting,
+# no import reordering, no line-length churn. Widening this set is a deliberate
+# decision for the repo owner, not something a passing build should force.
+target-version = "py311"  # CI runs 3.11 even though the local venv is 3.14.
+
+[lint]
+select = ["E9", "F"]

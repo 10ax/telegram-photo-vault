@@ -229,3 +229,118 @@ rtk init --global       # Add RTK to ~/.claude/CLAUDE.md
 | Network | curl, wget | 65-70% |
 
 Overall average: **60-90% token reduction** on common development operations.
+<!-- autodoc:begin -->
+<!-- autodoc: d73b7ae 2026-09-17 -->
+---
+
+## Verification (added 2026-09-17)
+
+These four commands are the contract. Run all of them from the repo root before
+claiming anything works; a green suite is the only evidence that counts.
+
+```bash
+uv venv --python 3.14 .venv
+VIRTUAL_ENV=.venv uv pip install -r requirements.txt -r requirements-dev.txt
+.venv/bin/python -m pytest -q
+.venv/bin/python -m ruff check .
+python3 -m compileall -q app scripts
+```
+
+`uv venv` does **not** put pip inside the venv — `.venv/bin/python -m pip`
+fails. Install through `uv pip install` with `VIRTUAL_ENV` pointed at the venv,
+as above, or build the venv with `python -m venv` instead.
+
+The local venv is Python **3.14**; `.github/workflows/ci.yml` runs **3.11**.
+Anything newer than 3.11 passes here and fails there. Before changing anything
+version-sensitive:
+
+```bash
+uv venv --python 3.11 /tmp/vault311
+VIRTUAL_ENV=/tmp/vault311 uv pip install -r requirements.txt -r requirements-dev.txt
+/tmp/vault311/bin/python -m pytest -q
+```
+
+### Linting
+
+`ruff.toml` enables only `E9` (syntax/IO errors) and `F` (pyflakes), with
+`target-version = "py311"`. It is an error-finder, not a formatter: no style,
+import-order or line-length rules, so it passes on the codebase unchanged — and
+note that `tests/test_backup_local_folder.py` deliberately puts imports part-way
+down the file, which a wider rule set would flag. Widening the selection is the
+owner's call, not something a failing build should force. Ruff also lints
+`.agents/skills/` (vendored third-party skills); it passes there today.
+
+### CI
+
+`.github/workflows/ci.yml` on push and pull_request, Python 3.11, with
+`concurrency` + `cancel-in-progress`: `compileall` → `ruff check .` → `pytest -q`.
+Deterministic steps only — no secrets, no network, no Telegram or MEGA. The
+Docker build is not exercised in CI. `.github/dependabot.yml` covers the
+`github-actions` ecosystem weekly and deliberately leaves pip alone: kurigram,
+Pillow and pillow-heif pin behaviour this archive depends on.
+
+## Writing tests here
+
+Follow the existing style — hand-written fakes that duck-type only the methods
+under test, never `unittest.mock` patching, and a `tmp_path` in preference to a
+mock whenever the code touches the filesystem. No network, no credentials, and
+no real Telegram/MEGA/SFTP call anywhere in the suite.
+
+Two loop rules that will bite you (see `tests/conftest.py`):
+
+- Use the `clean_db` fixture. It drops and recreates the schema and **disposes
+  the engine**, because `app/models/database.py` builds the engine as a module
+  global and pooled aiosqlite connections must not cross event loops.
+- Any fixture that creates its own loop (the `client` fixture in
+  `tests/test_api.py` calls `asyncio.run`) must dispose the engine itself.
+  `tests/test_db_migrations.py` disposes in a `finally` for the same reason.
+
+### What the suite covers, by file
+
+| file | what it pins |
+|---|---|
+| `test_telegram_uploads.py` | **`force_document=True` on every archival send**, the caption date chain, upload pacing, best-effort browse mirroring, exact-name chunk lookup |
+| `test_worker_state_machine.py` | step dispatch, videos skipping WebP/SFTP, `_finalize` as the only deleter, retry → `failed_status` → `FAILED`, discovery idempotency |
+| `test_chunked_flow.py` | the chunked upload end to end, including cat-merge equivalence and chunk reuse after a crash |
+| `test_chunking.py` | chunk planning, naming, hashing, `ChunkWindow`, manifest shape |
+| `test_vault_merge_cli.py` | the restore CLI as a subprocess: refusals, manifest contract, path flags |
+| `test_recovery_flow.py` / `test_recovery_rules.py` | the tidy end to end / its rules: vault-artifact detection, EXIF need, caption merging and truncation, the disk floor |
+| `test_browse_publish.py` / `test_browse_backfill.py` | the gallery mirror and its server-side backfill |
+| `test_api.py` / `test_api_guards.py` | the happy paths / the refusals: 401, 503, 409, and the retry resume-point rule |
+| `test_db_migrations.py` | `init_db()` upgrading a legacy SQLite file in place, idempotently |
+| `test_backup_local_folder.py` / `test_backup_reporting.py` | the migration script's per-file pipeline / its report and CLI guards |
+| `test_mega_commands.py` | the MEGAcmd subprocess contract, using shell-script stand-ins |
+| `test_sftp_service.py` | the host-key guard and remote-path normalisation (no SSH attempted) |
+| `test_image_compression.py` | the WebP mirror: long-side cap, mode conversion, EXIF rotation |
+
+`docs/TROUBLESHOOTING.md` ends with a **Known issues** section listing what is
+broken and deliberately left unfixed, plus what the suite cannot cover
+(`lifespan`, the dashboard, and anything needing the real services).
+
+## What not to touch
+
+- **`force_document=True`.** See above, and commit `9aaa70a`.
+- **The on-channel formats** — chunk names, chunk/manifest captions, the
+  manifest JSON. Files already uploaded carry them forever, and the channel must
+  stay self-describing without this repo or its database.
+- **`scripts/vault_merge.py`'s stdlib-only rule.** It has to run where nothing
+  else is installed.
+- **`AGENTS.md`, `README.md`, `docs/REFERENCE.md` prose and the sections of this
+  file above this block** — hand-written and current. Add, don't rewrite.
+- **`.agents/skills/` and `skills-lock.json`** — vendored from an external
+  source; regenerate them there, not here.
+- **Existing database columns.** There is no migration tool; columns are added
+  (nullable or defaulted, via `_COLUMN_MIGRATIONS`) and never renamed or
+  dropped.
+
+## Repeatable workflows
+
+`.claude/skills/` holds the three this repo actually repeats:
+
+- `tidy-channel-batch` — scan, dry-run and run one batch of the channel tidy,
+  and read the batch counters afterwards.
+- `restore-chunked-file` — get a >2 GB file back out of the channel and verify
+  it.
+- `add-config-knob` — the five edits an environment variable needs, from
+  `lifespan` through to both reference documents.
+<!-- autodoc:end -->

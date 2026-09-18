@@ -2,7 +2,11 @@
 .worktrees/
 __pycache__/
 *.py[cod]
-.claude/
+.venv/
+# Local Claude Code state stays out of git, but the repo's own workflow skills
+# under .claude/skills/ are committed (see .claude/skills/*/SKILL.md).
+.claude/*
+!.claude/skills/
 data/
 local-data/
 mega-config/
