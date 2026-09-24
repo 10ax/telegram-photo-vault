@@ -456,7 +456,10 @@ async def test_device_tables_are_created_on_a_legacy_database():
         await init_db()
 
         async with engine.begin() as conn:
-            for table in ("device_snapshots", "device_findings", "deletion_audits"):
+            # The names come from the models, so renaming a __tablename__ without
+            # updating this test fails here instead of passing quietly.
+            for model in (DeviceSnapshot, DeviceFinding, DeletionAudit):
+                table = model.__tablename__
                 result = await conn.exec_driver_sql(
                     "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,)
                 )
@@ -502,7 +505,7 @@ async def test_every_new_column_is_nullable_or_defaulted():
             )
 ```
 
-Add `DeletionAudit`, `DeviceFinding`, `DeviceSnapshot` to the existing import block at the top of the file.
+Add `DeletionAudit`, `DeviceFinding`, `DeviceSnapshot` to the existing import block at the top of the file. The loop above uses them, so the imports are load-bearing rather than decorative — importing them without a reference would fail `ruff` as F401.
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
