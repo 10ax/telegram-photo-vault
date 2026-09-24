@@ -222,6 +222,7 @@ class CatalogItem(Base):
     artifact: Mapped[str | None] = mapped_column(String(16), nullable=True)
     file_name: Mapped[str | None] = mapped_column(String(512), nullable=True, index=True)
     file_size: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    mime_type: Mapped[str | None] = mapped_column(String(128), nullable=True)
     # When it was posted, which for a migrated archive is not when it was shot.
     message_date: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     sha256: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)

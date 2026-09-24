@@ -53,6 +53,8 @@ Technical reference for Telegram Photo Vault. For setup and workflows, see the
 | `ODROID_REMOTE_DIR` | `/srv/photo-vault` | |
 | `ODROID_ALLOW_INSECURE_HOST_KEY` | `false` | Test-only: skips host-key verification |
 | `DATA_VOLUME_PATH` | `/data` | Disk reported by `/api/system` |
+| `IPHONE_CHANNEL_ID` | unset | Third channel to catalogue, created by `scripts/backup_local_folder.py`. Its id is in the `meta` table of that script's state DB. Unset means the channel is skipped. |
+| `CATALOG_SCAN_DELAY` | `2` | Seconds between channels during a full scan |
 
 ## HTTP API
 

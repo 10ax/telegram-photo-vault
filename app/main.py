@@ -16,7 +16,8 @@ logging.basicConfig(
 )
 
 from app.api.routes import router as api_router
-from app.models.database import init_db
+from app.models.database import ChannelRole, init_db
+from app.services.catalog import CatalogService, ChannelSpec
 from app.services.mega import MegaService
 from app.services.recovery import MEDIA_KINDS, RecoveryService
 from app.services.sftp import SFTPService
@@ -80,13 +81,14 @@ async def lifespan(app: FastAPI):
     try:
         mega_service = MegaService(target_folder=os.getenv("MEGA_TARGET_FOLDER", "/Camera"))
         browse_channel_raw = _optional_env("BROWSE_CHANNEL_ID")
+        browse_channel_id = (
+            _parse_int_or_str(browse_channel_raw) if browse_channel_raw else None
+        )
         telegram_service = TelegramService(
             telegram_client,
             telegram_channel_id,
             upload_delay_seconds=float(os.getenv("TELEGRAM_UPLOAD_DELAY", "5")),
-            browse_channel_id=(
-                _parse_int_or_str(browse_channel_raw) if browse_channel_raw else None
-            ),
+            browse_channel_id=browse_channel_id,
         )
 
         sftp_key_path = _optional_env("ODROID_KEY_PATH")
@@ -140,10 +142,26 @@ async def lifespan(app: FastAPI):
             ),
         )
 
+        iphone_channel_raw = _optional_env("IPHONE_CHANNEL_ID")
+        catalog_channels = [ChannelSpec(telegram_channel_id, ChannelRole.ARCHIVE)]
+        if browse_channel_id is not None:
+            catalog_channels.append(ChannelSpec(browse_channel_id, ChannelRole.MIRROR))
+        if iphone_channel_raw:
+            catalog_channels.append(
+                ChannelSpec(_parse_int_or_str(iphone_channel_raw), ChannelRole.ARCHIVE)
+            )
+
+        catalog = CatalogService(
+            telegram_client,
+            catalog_channels,
+            scan_delay_seconds=float(os.getenv("CATALOG_SCAN_DELAY", "2")),
+        )
+
         worker_task = asyncio.create_task(worker.run_forever(), name="photo-worker")
         app.state.worker = worker
         app.state.worker_task = worker_task
         app.state.recovery = recovery
+        app.state.catalog = catalog
         app.state.telegram_client = telegram_client
 
         yield

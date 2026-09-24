@@ -108,6 +108,11 @@ Pyrogram fork, same `pyrogram` namespace), Pillow (+pillow-heif), asyncssh.
   downloaded this many GB of EXIF-only files)
 - `RECOVERY_DELETE_OLD` (default: `true`; legacy — the in-place tidy never
   deletes originals, so this is currently informational only)
+- `IPHONE_CHANNEL_ID` (default: unset; third channel to catalogue, created by
+  `scripts/backup_local_folder.py`. Its id is in the `meta` table of that
+  script's state DB. Unset means the channel is skipped.)
+- `CATALOG_SCAN_DELAY` (default: `2`; seconds between channels during a full
+  catalog scan)
 
 ## Local Run
 1. `pip install -r requirements.txt`

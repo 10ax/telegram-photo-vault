@@ -47,6 +47,8 @@ services:
       RECOVERY_BATCH_SIZE: ${RECOVERY_BATCH_SIZE:-300}
       RECOVERY_MIN_FREE_GB: ${RECOVERY_MIN_FREE_GB:-10}
       RECOVERY_BATCH_MAX_DOWNLOAD_GB: ${RECOVERY_BATCH_MAX_DOWNLOAD_GB:-5}
+      IPHONE_CHANNEL_ID: ${IPHONE_CHANNEL_ID:-}
+      CATALOG_SCAN_DELAY: ${CATALOG_SCAN_DELAY:-2}
     volumes:
       - ./data:/data
       - ./mega-config:/root/.megaCmd
