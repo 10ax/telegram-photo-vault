@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import io
 import re
 from datetime import datetime
@@ -15,6 +16,10 @@ from pyrogram.types import Message
 register_heif_opener()
 
 EXIF_DATETIME_TAGS = (36867, 36868, 306)
+
+# Telegram streams file bytes in fixed 1 MiB chunks; a smaller range cannot be
+# requested. Fingerprinting fetches exactly the first and last whole chunk.
+STREAM_CHUNK_BYTES = 1024 * 1024
 
 # Dates embedded in camera filenames, e.g. IMG_20240612_193000.jpg, VID-20230101-WA0001.mp4,
 # 2024-06-12 19.30.00.jpg. Time components are optional.
@@ -303,3 +308,35 @@ class TelegramService:
         except Exception:
             return None
         return None
+
+    async def partial_fingerprint(
+        self, message, *, file_size: int, window: int = 262_144
+    ) -> dict[str, str]:
+        """Hash the first and last `window` bytes of an archived file.
+
+        Settles an ambiguous local file against its archived copy without
+        downloading it. Telegram streams in 1 MiB chunks, so this fetches the
+        first and last whole chunk and slices them: two chunks, whatever the
+        file's size, and nothing written to disk.
+        """
+        head = await self._read_chunk(message, 0)
+        last_index = max((file_size - 1) // STREAM_CHUNK_BYTES, 0)
+        tail = head if last_index == 0 else await self._read_chunk(message, last_index)
+
+        return {
+            "head_sha256": hashlib.sha256(head[:window]).hexdigest(),
+            "tail_sha256": hashlib.sha256(tail[-window:]).hexdigest(),
+        }
+
+    async def fingerprint_message(
+        self, channel_id: int, message_id: int, *, file_size: int, window: int = 262_144
+    ) -> dict[str, str]:
+        """Fetch one archived message and fingerprint it."""
+        message = await self.client.get_messages(channel_id, message_id)
+        return await self.partial_fingerprint(message, file_size=file_size, window=window)
+
+    async def _read_chunk(self, message, index: int) -> bytes:
+        buffer = bytearray()
+        async for part in self.client.stream_media(message, offset=index, limit=1):
+            buffer.extend(part)
+        return bytes(buffer)
