@@ -88,7 +88,12 @@ async def test_the_same_message_id_in_two_channels_is_two_rows(clean_db):
 
 from types import SimpleNamespace
 
-from app.services.catalog import CatalogService, ChannelSpec, classify_artifact
+from app.services.catalog import (
+    CatalogService,
+    ChannelSpec,
+    channel_spec_or_none,
+    classify_artifact,
+)
 
 
 def _doc(mid, name, size=1000, date=None):
@@ -135,6 +140,18 @@ def test_chunk_parts_and_manifests_are_classified_and_plain_names_are_not():
     assert classify_artifact("movie.mp4.manifest.json") == "manifest"
     assert classify_artifact("PXL_20230331_135108850.jpg") is None
     assert classify_artifact(None) is None
+
+
+def test_a_numeric_channel_id_becomes_a_channel_spec():
+    spec = channel_spec_or_none("TELEGRAM_CHANNEL_ID", -100, ChannelRole.ARCHIVE)
+    assert spec == ChannelSpec(-100, ChannelRole.ARCHIVE)
+
+
+def test_a_username_channel_id_is_skipped_rather_than_crashing_a_scan():
+    """catalog_items.channel_id is a BigInteger — a channel addressed by
+    username has no numeric id to catalogue and must be skipped, not raise."""
+    spec = channel_spec_or_none("TELEGRAM_CHANNEL_ID", "@somechannel", ChannelRole.ARCHIVE)
+    assert spec is None
 
 
 async def test_a_scan_ingests_every_media_message_with_its_channel_and_role(clean_db):

@@ -17,7 +17,7 @@ logging.basicConfig(
 
 from app.api.routes import router as api_router
 from app.models.database import ChannelRole, init_db
-from app.services.catalog import CatalogService, ChannelSpec
+from app.services.catalog import CatalogService, ChannelSpec, channel_spec_or_none
 from app.services.mega import MegaService
 from app.services.recovery import MEDIA_KINDS, RecoveryService
 from app.services.sftp import SFTPService
@@ -143,13 +143,27 @@ async def lifespan(app: FastAPI):
         )
 
         iphone_channel_raw = _optional_env("IPHONE_CHANNEL_ID")
-        catalog_channels = [ChannelSpec(telegram_channel_id, ChannelRole.ARCHIVE)]
+        catalog_channels: list[ChannelSpec] = []
+
+        archive_spec = channel_spec_or_none(
+            "TELEGRAM_CHANNEL_ID", telegram_channel_id, ChannelRole.ARCHIVE
+        )
+        if archive_spec is not None:
+            catalog_channels.append(archive_spec)
+
         if browse_channel_id is not None:
-            catalog_channels.append(ChannelSpec(browse_channel_id, ChannelRole.MIRROR))
-        if iphone_channel_raw:
-            catalog_channels.append(
-                ChannelSpec(_parse_int_or_str(iphone_channel_raw), ChannelRole.ARCHIVE)
+            mirror_spec = channel_spec_or_none(
+                "BROWSE_CHANNEL_ID", browse_channel_id, ChannelRole.MIRROR
             )
+            if mirror_spec is not None:
+                catalog_channels.append(mirror_spec)
+
+        if iphone_channel_raw:
+            iphone_spec = channel_spec_or_none(
+                "IPHONE_CHANNEL_ID", _parse_int_or_str(iphone_channel_raw), ChannelRole.ARCHIVE
+            )
+            if iphone_spec is not None:
+                catalog_channels.append(iphone_spec)
 
         catalog = CatalogService(
             telegram_client,

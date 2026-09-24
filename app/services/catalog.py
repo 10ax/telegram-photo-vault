@@ -24,8 +24,6 @@ from app.models.database import (
 
 logger = logging.getLogger(__name__)
 
-MEDIA_KINDS = ("photo", "video", "document", "animation")
-
 # Same contract as app/services/chunking.py: name.partNNN-of-MMM plus a JSON
 # manifest. These are vault artifacts, not user media, and must not be counted
 # as photos by anything downstream.
@@ -48,8 +46,29 @@ def classify_artifact(file_name: str | None) -> str | None:
 
 @dataclass(frozen=True)
 class ChannelSpec:
-    channel_id: int | str
+    channel_id: int
     role: ChannelRole
+
+
+def channel_spec_or_none(
+    var_name: str, value: int | str, role: ChannelRole
+) -> ChannelSpec | None:
+    """Build a `ChannelSpec`, or `None` (after logging) if `value` isn't numeric.
+
+    `catalog_items.channel_id` is a `BigInteger` column, so a channel addressed
+    by username (e.g. `"@somechannel"`) cannot be catalogued. The composition
+    root uses this so a deployment with a username-only channel id still
+    starts — that channel is just skipped by the catalog, not the app.
+    """
+    if isinstance(value, int):
+        return ChannelSpec(value, role)
+    logger.warning(
+        "%s=%r is not numeric; the catalog cannot index a channel addressed by "
+        "username, so it is being skipped.",
+        var_name,
+        value,
+    )
+    return None
 
 
 def _media_info(message) -> tuple[str, str | None, int | None, str | None] | None:
@@ -136,7 +155,7 @@ class CatalogService:
         file_size: int | None,
         mime_type: str | None,
     ) -> str:
-        channel_id = int(spec.channel_id)
+        channel_id = spec.channel_id
         async with AsyncSessionLocal() as session:
             existing = await session.scalar(
                 select(CatalogItem).where(
