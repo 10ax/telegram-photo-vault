@@ -51,6 +51,7 @@ services:
       CATALOG_SCAN_DELAY: ${CATALOG_SCAN_DELAY:-2}
       RECONCILE_MAX_ENTRIES: ${RECONCILE_MAX_ENTRIES:-10000}
       RECONCILE_FINGERPRINT_BYTES: ${RECONCILE_FINGERPRINT_BYTES:-262144}
+      BACKUP_STATE_DB: ${BACKUP_STATE_DB:-}
     volumes:
       - ./data:/data
       - ./mega-config:/root/.megaCmd

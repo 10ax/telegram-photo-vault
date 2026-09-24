@@ -143,14 +143,6 @@ async def lifespan(app: FastAPI):
             ),
         )
 
-        reconcile_service = ReconcileService(
-            max_entries=int(os.getenv("RECONCILE_MAX_ENTRIES", "10000")),
-            fingerprint_bytes=int(os.getenv("RECONCILE_FINGERPRINT_BYTES", "262144")),
-        )
-        app.state.reconcile = reconcile_service
-        # The verify endpoint needs the service, not just the raw client already on state.
-        app.state.telegram = telegram_service
-
         iphone_channel_raw = _optional_env("IPHONE_CHANNEL_ID")
         catalog_channels: list[ChannelSpec] = []
 
@@ -174,11 +166,32 @@ async def lifespan(app: FastAPI):
             if iphone_spec is not None:
                 catalog_channels.append(iphone_spec)
 
+        backup_state_db = _optional_env("BACKUP_STATE_DB")
+
         catalog = CatalogService(
             telegram_client,
             catalog_channels,
             scan_delay_seconds=float(os.getenv("CATALOG_SCAN_DELAY", "2")),
+            # The worker's own channel, so provenance matching cannot attribute
+            # a message id from one channel to a row in another.
+            worker_channel_id=archive_spec.channel_id if archive_spec is not None else None,
+            backup_state_db=backup_state_db,
         )
+
+        # Built after the channel list, because the freshness gate has to know
+        # every archive channel: an unscanned one is a hole in the frontier.
+        reconcile_service = ReconcileService(
+            max_entries=int(os.getenv("RECONCILE_MAX_ENTRIES", "10000")),
+            fingerprint_bytes=int(os.getenv("RECONCILE_FINGERPRINT_BYTES", "262144")),
+            archive_channel_ids=[
+                spec.channel_id
+                for spec in catalog_channels
+                if spec.role is ChannelRole.ARCHIVE
+            ],
+        )
+        app.state.reconcile = reconcile_service
+        # The verify endpoint needs the service, not just the raw client already on state.
+        app.state.telegram = telegram_service
 
         worker_task = asyncio.create_task(worker.run_forever(), name="photo-worker")
         app.state.worker = worker
@@ -192,6 +205,10 @@ async def lifespan(app: FastAPI):
         recovery_service = getattr(app.state, "recovery", None)
         if recovery_service is not None:
             await recovery_service.shutdown()
+
+        catalog_service = getattr(app.state, "catalog", None)
+        if catalog_service is not None:
+            await catalog_service.shutdown()
 
         if worker_task is not None:
             worker_task.cancel()

@@ -118,7 +118,14 @@ Pyrogram fork, same `pyrogram` namespace), Pillow (+pillow-heif), asyncssh.
   message telling the client to continue against the same `snapshot_id`.)
 - `RECONCILE_FINGERPRINT_BYTES` (default: `262144`; bytes hashed at each end
   of a file when `POST /api/vault/verify` settles an ambiguous match. Telegram
-  streams in 1 MiB chunks, so the traffic cost is 2 MiB regardless.)
+  streams in 1 MiB chunks, so the traffic cost is 2 MiB regardless, and a value
+  above 1 MiB is clamped to it. `GET /api/catalog/freshness` publishes the
+  effective value as `fingerprint_window_bytes`, which is the window a client
+  has to hash locally for the two sides to agree.)
+- `BACKUP_STATE_DB` (default: unset; path to `scripts/backup_local_folder.py`'s
+  own state DB. When set, a catalog scan also attributes rows to that script,
+  using the channel recorded in that DB's `meta` table — never a bare message
+  id, which means nothing outside its own channel.)
 
 ## Local Run
 1. `pip install -r requirements.txt`

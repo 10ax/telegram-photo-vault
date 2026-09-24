@@ -24,6 +24,7 @@ from app.models.database import (
     Photo,
     PhotoStatus,
 )
+from app.services.telegram import STREAM_CHUNK_BYTES
 
 IN_FLIGHT_STATUSES = frozenset(
     {
@@ -204,24 +205,72 @@ _VERDICT_COLUMNS = {
 class ReconcileService:
     """Fetches candidates for an inventory and asks `decide` about each entry."""
 
-    def __init__(self, *, max_entries: int = 10_000, fingerprint_bytes: int = 262_144) -> None:
+    def __init__(
+        self,
+        *,
+        max_entries: int = 10_000,
+        fingerprint_bytes: int = 262_144,
+        archive_channel_ids: Sequence[int] | None = None,
+    ) -> None:
         self.max_entries = max_entries
-        self.fingerprint_bytes = fingerprint_bytes
+        # A window wider than one Telegram stream chunk would be silently
+        # truncated by the fingerprint, and this value is published to clients
+        # as the window they must hash locally — so it is clamped here, once,
+        # where the effective number is decided.
+        self.fingerprint_bytes = max(1, min(fingerprint_bytes, STREAM_CHUNK_BYTES))
+        # The archive channels this deployment is configured with. Knowing them
+        # is what lets an archive channel that has never been scanned count as
+        # a hole in the frontier rather than simply not existing.
+        self.archive_channel_ids = tuple(archive_channel_ids or ())
 
     async def catalog_freshness(self) -> dict[str, object]:
-        """Newest archive-channel message the catalog has seen, and how many rows."""
+        """How far the catalog has been scanned, per archive channel and overall.
+
+        `newest_message_date` is the **oldest** of the per-channel frontiers,
+        not the newest overall. With more than one archive channel a freshly
+        scanned one would otherwise drag the single maximum forward and let
+        every stale-channel `NAME_SIZE` match sail through the freshness gate
+        that exists to demote it. An archive channel with no catalogued rows
+        has no frontier at all, so the whole value is `None` and every
+        metadata match fails closed until it is scanned.
+        """
         async with AsyncSessionLocal() as session:
-            newest = await session.scalar(
-                select(func.max(CatalogItem.message_date)).where(
-                    CatalogItem.channel_role == ChannelRole.ARCHIVE
+            result = await session.execute(
+                select(
+                    CatalogItem.channel_id,
+                    func.max(CatalogItem.message_date),
+                    func.count(CatalogItem.id),
                 )
-            )
-            rows = await session.scalar(
-                select(func.count())
-                .select_from(CatalogItem)
                 .where(CatalogItem.channel_role == ChannelRole.ARCHIVE)
+                .group_by(CatalogItem.channel_id)
             )
-        return {"newest_message_date": newest, "archive_rows": int(rows or 0)}
+            scanned = {
+                int(channel_id): (newest, int(rows or 0))
+                for channel_id, newest, rows in result.all()
+            }
+
+        # Configured channels that hold no rows yet still belong in the answer.
+        channel_ids = set(scanned) | set(self.archive_channel_ids)
+        per_channel = [
+            {
+                "channel_id": channel_id,
+                "newest_message_date": scanned.get(channel_id, (None, 0))[0],
+                "rows": scanned.get(channel_id, (None, 0))[1],
+            }
+            for channel_id in sorted(channel_ids)
+        ]
+
+        frontiers = [entry["newest_message_date"] for entry in per_channel]
+        oldest_frontier = (
+            min(frontiers) if frontiers and all(f is not None for f in frontiers) else None
+        )
+
+        return {
+            "newest_message_date": oldest_frontier,
+            "archive_rows": sum(entry["rows"] for entry in per_channel),
+            "fingerprint_window_bytes": self.fingerprint_bytes,
+            "channels": per_channel,
+        }
 
     async def evaluate(
         self, entries: Sequence[dict], *, freshness_gate: bool = True
@@ -468,9 +517,14 @@ class ReconcileService:
         if not names:
             return {}
         async with AsyncSessionLocal() as session:
-            rows = await session.execute(
-                select(Photo.mega_path, Photo.status).order_by(Photo.mega_path)
-            )
+            # Materialised inside the block: a Result is only iterable while
+            # its session is open, and relying on the rows happening to be
+            # buffered is a bug waiting for a driver change.
+            rows = (
+                await session.execute(
+                    select(Photo.mega_path, Photo.status).order_by(Photo.mega_path)
+                )
+            ).all()
         statuses: dict[str, PhotoStatus] = {}
         for mega_path, status in rows:
             basename = mega_path.rsplit("/", 1)[-1]

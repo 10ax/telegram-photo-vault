@@ -7,7 +7,7 @@ from datetime import datetime
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 
 from app.models.database import (
@@ -18,6 +18,7 @@ from app.models.database import (
     RecoveryItem,
     RecoveryStatus,
 )
+from app.services.catalog import CatalogBusyError
 from app.services.reconcile import (
     CatalogNeverScanned,
     ReconcileService,
@@ -334,7 +335,10 @@ async def get_system() -> dict[str, int | float | str]:
 class ReconcileEntry(BaseModel):
     relpath: str
     name: str
-    size: int
+    # A file cannot be a negative number of bytes; accepting one would let a
+    # malformed inventory drive a snapshot's total_bytes below zero, and the
+    # totals are what the owner reads before deciding how much to delete.
+    size: int = Field(ge=0)
     mtime: str | None = None
     sha256: str | None = None
 
@@ -350,7 +354,7 @@ class ReconcileRequest(BaseModel):
 class DeletionRecord(BaseModel):
     relpath: str
     name: str
-    size: int
+    size: int = Field(ge=0)
     tier: MatchTier
     channel_id: int
     tg_message_id: int
@@ -478,10 +482,19 @@ def _require_catalog(request: Request):
 
 @router.post("/catalog/scan")
 async def catalog_scan(request: Request) -> dict[str, object]:
+    """Start a background rescan of every configured channel. `409` if one is running."""
     catalog = _require_catalog(request)
-    results = await catalog.scan_all()
-    matched = await catalog.match_all(os.getenv("BACKUP_STATE_DB") or None)
-    return {"scanned": results, "matched": matched}
+    try:
+        catalog.start_scan()
+    except CatalogBusyError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+    return catalog.status_snapshot()
+
+
+@router.get("/catalog/status")
+async def catalog_status(request: Request) -> dict[str, object]:
+    """Whether a scan is running, and what the last one found."""
+    return _require_catalog(request).status_snapshot()
 
 
 @router.post("/catalog/resolve-manifests")
@@ -517,8 +530,17 @@ async def vault_verify(request: Request, payload: VerifyRequest) -> dict[str, ob
                 "was not found or has been deleted."
             ),
         )
+    # Tier A- is "equal fingerprints **plus equal size**", and the size half is
+    # not decoration: the commonest reason an entry is AMBIGUOUS at all is
+    # size_mismatch, and two files can share 512 KiB of head and tail while
+    # differing in the middle. A client that deletes on `match: true` must be
+    # getting the whole condition, so the size is compared here rather than
+    # left for the client to remember.
+    archived_file_size = archived.get("archived_file_size")
     matched = (
         archived["head_sha256"] == payload.head_sha256
         and archived["tail_sha256"] == payload.tail_sha256
+        and archived_file_size is not None
+        and archived_file_size == payload.file_size
     )
-    return {"match": matched, **archived}
+    return {"match": matched, **archived, "archived_file_size": archived_file_size}

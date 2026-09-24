@@ -17,6 +17,7 @@ from app.models.database import (
     ChannelRole,
     DeletionAudit,
 )
+from app.services.catalog import CatalogBusyError
 from app.services.reconcile import ReconcileService
 from app.services.telegram import ArchivedMessageMissing
 
@@ -25,13 +26,18 @@ KEY = "test-key"
 
 
 class FakeTelegram:
-    """Duck-types only fingerprint_message, returning a fixed digest pair."""
+    """Duck-types only fingerprint_message: a fixed digest pair and a size.
 
-    def __init__(self, fingerprint: dict[str, str]):
+    The size is the archived copy's own, as the real service reports it — the
+    client's claimed size is never echoed back.
+    """
+
+    def __init__(self, fingerprint: dict[str, str], archived_file_size: int | None = 100):
         self.fingerprint = fingerprint
+        self.archived_file_size = archived_file_size
 
     async def fingerprint_message(self, channel_id, message_id, *, file_size, window):
-        return dict(self.fingerprint)
+        return {**self.fingerprint, "archived_file_size": self.archived_file_size}
 
 
 class MissingMessageTelegram:
@@ -210,11 +216,61 @@ def test_verify_compares_the_clients_fingerprint_with_the_archived_copy(client, 
     })
     assert agreeing.json()["match"] is True
 
+    assert agreeing.json()["archived_file_size"] == 100
+
     disagreeing = _post(client, "/api/vault/verify", {
         "channel_id": ARCHIVE, "tg_message_id": 1, "file_size": 100,
         "head_sha256": "h" * 64, "tail_sha256": "x" * 64,
     })
     assert disagreeing.json()["match"] is False
+
+
+def test_verify_refuses_a_match_when_the_archived_size_differs(client, app_state):
+    """Tier A- is equal fingerprints *plus equal size*. Two files can share
+    512 KiB of head and tail and differ in the middle, and size_mismatch is the
+    commonest reason an entry is AMBIGUOUS in the first place — so agreeing
+    digests alone must never come back as `match: true`."""
+    app_state.telegram = FakeTelegram(
+        {"head_sha256": "h" * 64, "tail_sha256": "t" * 64}, archived_file_size=999
+    )
+
+    response = _post(client, "/api/vault/verify", {
+        "channel_id": ARCHIVE, "tg_message_id": 1, "file_size": 100,
+        "head_sha256": "h" * 64, "tail_sha256": "t" * 64,
+    })
+
+    body = response.json()
+    assert body["match"] is False
+    assert body["archived_file_size"] == 999
+
+
+def test_verify_refuses_a_match_when_the_archived_size_is_unknown(client, app_state):
+    """A message carrying no size at all (a native photo, say) is not evidence."""
+    app_state.telegram = FakeTelegram(
+        {"head_sha256": "h" * 64, "tail_sha256": "t" * 64}, archived_file_size=None
+    )
+
+    response = _post(client, "/api/vault/verify", {
+        "channel_id": ARCHIVE, "tg_message_id": 1, "file_size": 100,
+        "head_sha256": "h" * 64, "tail_sha256": "t" * 64,
+    })
+
+    assert response.json()["match"] is False
+
+
+def test_a_negative_entry_size_is_refused_rather_than_totalled(client):
+    """A negative size would drive the snapshot's total_bytes below zero, and
+    that total is what the owner reads before deciding how much to delete."""
+    entry = _entry()
+    entry["size"] = -1
+    assert _post(client, "/api/devices/pixel/reconcile", {"entries": [entry]}).status_code == 422
+
+    deletion = {
+        "relpath": "DCIM/a.jpg", "name": "a.jpg", "size": -1,
+        "tier": "NAME_SIZE", "channel_id": ARCHIVE, "tg_message_id": 1,
+    }
+    assert _post(client, "/api/devices/pixel/deletions",
+                 {"deleted": [deletion]}).status_code == 422
 
 
 def test_verify_without_a_telegram_service_is_503(client):
@@ -240,39 +296,62 @@ def test_verify_of_a_missing_message_is_404_not_500(client, app_state):
     assert "999" in detail
 
 
+class FakeCatalog:
+    """Duck-types the background-task surface the scan route uses."""
+
+    def __init__(self, *, busy=False):
+        self.busy = busy
+        self.calls: list[str] = []
+
+    def start_scan(self):
+        self.calls.append("start_scan")
+        if self.busy:
+            raise CatalogBusyError("A catalog task is already running.")
+
+    def status_snapshot(self):
+        return {"running": self.busy, "activity": None, "last_error": None,
+                "result": None, "channels": []}
+
+    async def resolve_manifests(self, limit=50):
+        self.calls.append(f"resolve_manifests:{limit}")
+        return {"resolved": 1, "failed": 0, "remaining": 0}
+
+
 def test_scan_and_resolve_routes_reach_the_catalog_service(client, app_state):
     """Without these two, nothing could ever populate the catalog."""
-
-    class FakeCatalog:
-        def __init__(self):
-            self.calls = []
-
-        async def scan_all(self):
-            self.calls.append("scan_all")
-            return {"-100": {"scanned": 3, "ingested": 3, "updated": 0}}
-
-        async def match_all(self, state_db_path=None):
-            self.calls.append("match_all")
-            return {"worker": 0, "backup_script": 0}
-
-        async def resolve_manifests(self, limit=50):
-            self.calls.append(f"resolve_manifests:{limit}")
-            return {"resolved": 1, "failed": 0, "remaining": 0}
-
     app_state.catalog = FakeCatalog()
 
     scanned = _post(client, "/api/catalog/scan", {})
     assert scanned.status_code == 200
-    assert scanned.json()["scanned"]["-100"]["ingested"] == 3
+    assert scanned.json()["running"] is False
 
     resolved = client.post("/api/catalog/resolve-manifests", params={"limit": 10},
                            headers={"X-Api-Key": KEY})
     assert resolved.json()["resolved"] == 1
-    assert app_state.catalog.calls == ["scan_all", "match_all", "resolve_manifests:10"]
+    assert app_state.catalog.calls == ["start_scan", "resolve_manifests:10"]
+
+
+def test_a_second_scan_while_one_is_running_is_409(client, app_state):
+    """A full history is minutes of paced traffic; two at once would race."""
+    app_state.catalog = FakeCatalog(busy=True)
+
+    response = _post(client, "/api/catalog/scan", {})
+
+    assert response.status_code == 409
+    assert "already running" in response.json()["detail"]
+
+
+def test_catalog_status_reports_whether_a_scan_is_running(client, app_state):
+    app_state.catalog = FakeCatalog(busy=True)
+
+    body = client.get("/api/catalog/status", headers={"X-Api-Key": KEY}).json()
+
+    assert body["running"] is True
 
 
 def test_the_catalog_routes_are_503_without_the_service(client):
     assert _post(client, "/api/catalog/scan", {}).status_code == 503
+    assert client.get("/api/catalog/status", headers={"X-Api-Key": KEY}).status_code == 503
     assert client.post("/api/catalog/resolve-manifests",
                        headers={"X-Api-Key": KEY}).status_code == 503
 

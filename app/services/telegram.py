@@ -108,6 +108,21 @@ async def build_caption(file_path: str | Path, fallback: datetime | None = None)
     return _format_caption(photo_datetime)
 
 
+def _archived_file_size(message) -> int | None:
+    """The size Telegram itself reports for a message's media, or None.
+
+    Only the kinds this vault archives as originals are consulted. A native
+    `photo` message is a re-encoded mirror and never proof of an original, so
+    it yields None here too — and None fails every size comparison closed.
+    """
+    for attribute in ("document", "video", "animation"):
+        media = getattr(message, attribute, None)
+        if media is not None:
+            size = getattr(media, "file_size", None)
+            return int(size) if size is not None else None
+    return None
+
+
 class ArchivedMessageMissing(RuntimeError):
     """The channel message fingerprint_message was asked for no longer exists.
 
@@ -324,13 +339,26 @@ class TelegramService:
         """Hash the first and last `window` bytes of an archived file.
 
         Settles an ambiguous local file against its archived copy without
-        downloading it. Telegram streams in 1 MiB chunks, so this fetches the
-        first and last whole chunk and slices them: two chunks, whatever the
-        file's size, and nothing written to disk.
+        downloading it. Telegram streams in 1 MiB chunks, so the head is the
+        start of the first chunk; the tail is genuinely the file's last
+        `window` bytes, which can straddle a chunk boundary when the final
+        chunk is shorter than the window (a 1,100,000-byte file ends in a
+        51,424-byte chunk). Hashing that short chunk instead would make a
+        byte-identical file fail to match, so the two chunks the range falls
+        in are read and sliced. `window` is clamped to one chunk, which is
+        what keeps "at most two chunks" true whatever the caller asks for.
         """
+        window = max(1, min(window, STREAM_CHUNK_BYTES))
         head = await self._read_chunk(message, 0)
+
+        start = max(file_size - window, 0)
+        first_index = start // STREAM_CHUNK_BYTES
         last_index = max((file_size - 1) // STREAM_CHUNK_BYTES, 0)
-        tail = head if last_index == 0 else await self._read_chunk(message, last_index)
+
+        spans: list[bytes] = []
+        for index in range(first_index, last_index + 1):
+            spans.append(head if index == 0 else await self._read_chunk(message, index))
+        tail = b"".join(spans)
 
         return {
             "head_sha256": hashlib.sha256(head[:window]).hexdigest(),
@@ -339,14 +367,28 @@ class TelegramService:
 
     async def fingerprint_message(
         self, channel_id: int, message_id: int, *, file_size: int, window: int = 262_144
-    ) -> dict[str, str]:
-        """Fetch one archived message and fingerprint it."""
+    ) -> dict[str, object]:
+        """Fetch one archived message, fingerprint it, and report its own size.
+
+        The size comes from the message's own media, never from the caller:
+        equal head and tail digests are not identity on their own, and the
+        endpoint that authorises a deletion has to be able to compare the
+        archived length with the local one. `file_size` is the caller's claim
+        and is used only as a fallback for choosing the tail's chunk range
+        when the message carries no size at all.
+        """
         message = await self.client.get_messages(channel_id, message_id)
         if message is None:
             raise ArchivedMessageMissing(
                 f"Message {message_id} in channel {channel_id} was not found or has been deleted."
             )
-        return await self.partial_fingerprint(message, file_size=file_size, window=window)
+        archived_file_size = _archived_file_size(message)
+        fingerprint = await self.partial_fingerprint(
+            message,
+            file_size=archived_file_size if archived_file_size is not None else file_size,
+            window=window,
+        )
+        return {**fingerprint, "archived_file_size": archived_file_size}
 
     async def _read_chunk(self, message, index: int) -> bytes:
         buffer = bytearray()

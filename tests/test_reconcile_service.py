@@ -13,9 +13,11 @@ from app.models.database import (
     PhotoStatus,
 )
 from app.services.reconcile import CatalogNeverScanned, ReconcileService
+from app.services.telegram import STREAM_CHUNK_BYTES
 
 ARCHIVE = -1002637897512
 MIRROR = -1004367643112
+IPHONE = -1002900000001
 SCANNED = datetime(2026, 7, 20, tzinfo=timezone.utc)
 OLDER = datetime(2026, 7, 1, tzinfo=timezone.utc)
 
@@ -110,6 +112,69 @@ async def test_an_unscanned_catalog_refuses_to_answer(clean_db):
     """Answering from an empty table would read as 'nothing you own is backed up'."""
     with pytest.raises(CatalogNeverScanned):
         await ReconcileService().evaluate([_entry()])
+
+
+async def test_the_oldest_archive_channel_governs_the_freshness_frontier(clean_db):
+    """With two archive channels the newest date overall is the wrong number:
+    it is whichever was scanned most recently, not how far behind the archive
+    is. The frontier is the oldest of them."""
+    await _row(tg_message_id=1, file_name="a.jpg", file_size=100, message_date=OLDER)
+    await _row(tg_message_id=1, channel_id=IPHONE, file_name="b.jpg", file_size=100,
+               message_date=SCANNED)
+
+    freshness = await ReconcileService().catalog_freshness()
+
+    assert freshness["newest_message_date"].replace(tzinfo=None) == OLDER.replace(tzinfo=None)
+    assert freshness["archive_rows"] == 2
+    assert [c["channel_id"] for c in freshness["channels"]] == sorted([ARCHIVE, IPHONE])
+
+
+async def test_a_freshly_scanned_second_archive_channel_cannot_vouch_for_a_stale_first(clean_db):
+    """The most important rule in the design: a photo taken after the last scan
+    of *its own* channel must not be declared archived because a different
+    archive channel was migrated yesterday."""
+    await _row(tg_message_id=1, file_name="a.jpg", file_size=100, message_date=OLDER)
+    await _row(tg_message_id=1, channel_id=IPHONE, file_name="b.jpg", file_size=1,
+               message_date=SCANNED)
+
+    entry = _entry(name="a.jpg", size=100,
+                   mtime=datetime(2026, 7, 10, tzinfo=timezone.utc).isoformat())
+    [decision] = await ReconcileService().evaluate([entry])
+
+    assert decision.verdict is DeviceVerdict.IN_FLIGHT
+    assert decision.reason == "catalog_older_than_file"
+
+
+async def test_a_configured_archive_channel_with_no_rows_fails_everything_closed(clean_db):
+    """No frontier at all is not the same as a distant one. Until that channel
+    is scanned, no metadata match anywhere may be promoted."""
+    await _row(tg_message_id=1, file_name="a.jpg", file_size=100)
+    service = ReconcileService(archive_channel_ids=[ARCHIVE, IPHONE])
+
+    freshness = await service.catalog_freshness()
+    assert freshness["newest_message_date"] is None
+    assert [c["rows"] for c in freshness["channels"] if c["channel_id"] == IPHONE] == [0]
+
+    [decision] = await service.evaluate([_entry()])
+    assert decision.verdict is DeviceVerdict.IN_FLIGHT
+    assert decision.reason == "catalog_older_than_file"
+
+
+async def test_freshness_publishes_the_window_a_client_must_hash(clean_db):
+    """A client cannot compute a matching fingerprint without knowing it."""
+    await _row(tg_message_id=1, file_name="a.jpg", file_size=100)
+
+    freshness = await ReconcileService(fingerprint_bytes=131_072).catalog_freshness()
+
+    assert freshness["fingerprint_window_bytes"] == 131_072
+
+
+def test_the_published_fingerprint_window_is_clamped_to_one_stream_chunk():
+    """Anything wider would be truncated by the fingerprint, so publishing it
+    unclamped would tell clients to hash bytes the server never reads."""
+    service = ReconcileService(fingerprint_bytes=4 * STREAM_CHUNK_BYTES)
+
+    assert service.fingerprint_bytes == STREAM_CHUNK_BYTES
 
 
 async def test_a_completed_row_never_shadows_a_veto_from_a_colliding_basename_a_then_b(clean_db):

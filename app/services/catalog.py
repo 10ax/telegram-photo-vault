@@ -13,6 +13,7 @@ import json
 import logging
 import re
 import sqlite3
+import traceback
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
@@ -72,6 +73,36 @@ def parse_manifest(payload: bytes) -> tuple[str, int, str]:
     return name, total_size, sha256
 
 
+def _backup_state_channel_id(conn: sqlite3.Connection, path: Path) -> int | None:
+    """`meta.channel_id` from the backup script's state DB, or None.
+
+    Its own `meta` table is where `scripts/backup_local_folder.py` records the
+    channel it uploaded to. A state DB written before that table existed simply
+    has no answer here, which is a fallback to hash matching, not an error.
+    """
+    try:
+        row = conn.execute("SELECT value FROM meta WHERE key = 'channel_id'").fetchone()
+    except sqlite3.Error:
+        row = None
+    if row is None or row[0] is None:
+        logger.info(
+            "Catalog match: backup state DB at %s records no channel id; matching on "
+            "sha256 alone, because a message id means nothing without its channel.",
+            path,
+        )
+        return None
+    value = str(row[0]).strip()
+    if not value.lstrip("-").isdigit():
+        logger.warning(
+            "Catalog match: backup state DB at %s has a non-numeric channel id %r; "
+            "matching on sha256 alone.",
+            path,
+            value,
+        )
+        return None
+    return int(value)
+
+
 @dataclass(frozen=True)
 class ChannelSpec:
     channel_id: int
@@ -116,6 +147,10 @@ def _media_info(message) -> tuple[str, str | None, int | None, str | None] | Non
     return None
 
 
+class CatalogBusyError(RuntimeError):
+    """A catalog task is already running; a second would race it."""
+
+
 class CatalogService:
     def __init__(
         self,
@@ -123,14 +158,91 @@ class CatalogService:
         channels: Sequence[ChannelSpec],
         *,
         scan_delay_seconds: float = 0.0,
+        worker_channel_id: int | None = None,
+        backup_state_db: str | Path | None = None,
     ) -> None:
         self.client = client
         self.channels = tuple(channels)
         self.scan_delay_seconds = scan_delay_seconds
+        # The channel the MEGA worker itself uploads to. Message ids restart at
+        # 1 in every channel, so provenance matching without this would
+        # mis-attribute rows across channels rather than fail to match.
+        self.worker_channel_id = worker_channel_id
+        self.backup_state_db = backup_state_db
+
+        self.activity: str | None = None
+        self.last_error: str | None = None
+        self._task: asyncio.Task[None] | None = None
+        self._result: dict[str, object] | None = None
+        self._last_result: dict[str, object] | None = None
 
     @property
     def archive_channels(self) -> tuple[ChannelSpec, ...]:
         return tuple(c for c in self.channels if c.role is ChannelRole.ARCHIVE)
+
+    @property
+    def running(self) -> bool:
+        return self._task is not None and not self._task.done()
+
+    def status_snapshot(self) -> dict[str, object]:
+        return {
+            "running": self.running,
+            "activity": self.activity if self.running else None,
+            "last_error": self.last_error,
+            "result": self._result if self.running else self._last_result,
+            "channels": [
+                {"channel_id": spec.channel_id, "role": spec.role.value}
+                for spec in self.channels
+            ],
+        }
+
+    def start_scan(self) -> None:
+        """Walk every configured channel's history, then attribute provenance.
+
+        A real channel is 18,000+ messages, which is minutes of paced Telegram
+        traffic — far longer than any HTTP client will wait, and two of them at
+        once would write the same rows from two directions. So this follows
+        RecoveryService: one background task per call, 409 while it runs.
+        """
+        self._start(self._scan_and_match(), "scanning channel history")
+
+    def _start(self, coroutine, activity: str) -> None:
+        if self.running:
+            coroutine.close()
+            raise CatalogBusyError("A catalog task is already running.")
+        self.activity = activity
+        self._result = None
+        self._task = asyncio.create_task(self._guarded(coroutine), name="catalog")
+
+    async def _guarded(self, coroutine) -> None:
+        try:
+            await coroutine
+            self.last_error = None
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Catalog task failed.")
+            self.last_error = traceback.format_exc()
+        finally:
+            self.activity = None
+            # Keep whatever the run got through, so a failure is still readable.
+            if self._result is not None:
+                self._last_result = self._result
+
+    async def shutdown(self) -> None:
+        if self._task is not None:
+            self._task.cancel()
+            try:
+                await self._task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._task = None
+
+    async def _scan_and_match(self) -> None:
+        scanned = await self.scan_all()
+        self._result = {"scanned": scanned, "matched": None}
+        matched = await self.match_all()
+        self._result = {"scanned": scanned, "matched": matched}
 
     async def scan_channel(self, spec: ChannelSpec) -> dict[str, int]:
         scanned = ingested = updated = 0
@@ -287,12 +399,24 @@ class CatalogService:
             return "unchanged"
 
     async def match_worker(self) -> int:
-        """Attribute rows to the MEGA worker by tg_message_id.
+        """Attribute rows to the MEGA worker by tg_message_id, in its own channel.
 
-        photos.tg_message_id is unique per archive channel, so this is an exact
-        join; there is no sha256 fallback because the worker never re-uploads a
-        file under a new message without also updating its row.
+        photos.tg_message_id is unique *within the worker's channel* and means
+        nothing outside it: every channel's ids start at 1, so the iPhone
+        migration channel holds a message 42 as surely as the main archive
+        does. Matching without the channel predicate would stamp one file's
+        sha256 and message id onto an unrelated row — and those two columns are
+        what the strongest verdict tier and the deletion audit are built on.
+        There is no sha256 fallback because the worker never re-uploads a file
+        under a new message without also updating its row.
         """
+        if self.worker_channel_id is None:
+            logger.info(
+                "Catalog match: no worker channel id configured, so no row can be "
+                "attributed to the worker without risking a cross-channel collision."
+            )
+            return 0
+
         matched = 0
         async with AsyncSessionLocal() as session:
             photos = {
@@ -306,7 +430,10 @@ class CatalogService:
 
             items = (
                 await session.scalars(
-                    select(CatalogItem).where(CatalogItem.source == CatalogSource.UNKNOWN)
+                    select(CatalogItem).where(
+                        CatalogItem.source == CatalogSource.UNKNOWN,
+                        CatalogItem.channel_id == self.worker_channel_id,
+                    )
                 )
             ).all()
 
@@ -325,11 +452,17 @@ class CatalogService:
         return matched
 
     async def match_backup_db(self, state_db_path: str | Path) -> int:
-        """Attribute rows to scripts/backup_local_folder.py.
+        """Attribute rows to scripts/backup_local_folder.py, in its own channel.
 
         That script keeps its own stdlib sqlite3 state DB, never the app's, so
         this reads it directly and read-only. A missing file is a normal
         configuration state, not an error: report zero and move on.
+
+        The script records the channel it wrote to in that DB's `meta` table,
+        and its message ids only mean anything there — every channel numbers
+        its messages from 1. With no channel id recorded (an older state DB),
+        a bare message id is not evidence of anything, so only sha256 is used:
+        content identity holds wherever the bytes sit.
         """
         path = Path(state_db_path)
         if not path.exists():
@@ -339,6 +472,7 @@ class CatalogService:
         try:
             conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
             try:
+                channel_id = _backup_state_channel_id(conn, path)
                 rows = conn.execute(
                     "SELECT rel_path, sha256, tg_message_id FROM files "
                     "WHERE tg_message_id IS NOT NULL"
@@ -349,7 +483,9 @@ class CatalogService:
             logger.warning("Catalog match: could not read backup state DB at %s: %s", path, exc)
             return 0
 
-        by_message = {int(mid): (rel, sha) for rel, sha, mid in rows}
+        by_message = (
+            {int(mid): (rel, sha) for rel, sha, mid in rows} if channel_id is not None else {}
+        )
         by_sha = {sha: (rel, int(mid)) for rel, sha, mid in rows if sha}
 
         matched = 0
@@ -361,7 +497,7 @@ class CatalogService:
             ).all()
 
             for item in items:
-                hit = by_message.get(item.tg_message_id)
+                hit = by_message.get(item.tg_message_id) if item.channel_id == channel_id else None
                 if hit is not None:
                     rel_path, sha = hit
                 elif item.sha256 and item.sha256 in by_sha:
@@ -381,9 +517,9 @@ class CatalogService:
         return matched
 
     async def match_all(self, state_db_path: str | Path | None = None) -> dict[str, int]:
+        """Both provenance passes; the state DB defaults to the configured one."""
+        state_db = state_db_path if state_db_path is not None else self.backup_state_db
         return {
             "worker": await self.match_worker(),
-            "backup_script": (
-                await self.match_backup_db(state_db_path) if state_db_path else 0
-            ),
+            "backup_script": (await self.match_backup_db(state_db) if state_db else 0),
         }

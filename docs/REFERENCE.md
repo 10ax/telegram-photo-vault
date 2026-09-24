@@ -58,7 +58,8 @@ Technical reference for Telegram Photo Vault. For setup and workflows, see the
 | `IPHONE_CHANNEL_ID` | unset | Third channel to catalogue, created by `scripts/backup_local_folder.py`. Its id is in the `meta` table of that script's state DB. Unset means the channel is skipped. |
 | `CATALOG_SCAN_DELAY` | `2` | Seconds between channels during a full scan |
 | `RECONCILE_MAX_ENTRIES` | `10000` | Inventory entries accepted per `reconcile` call; more is refused with `413` and a message telling the client to continue against the same `snapshot_id` |
-| `RECONCILE_FINGERPRINT_BYTES` | `262144` | Bytes hashed at each end of a file when `/api/vault/verify` settles an ambiguous match. Telegram streams in 1 MiB chunks, so the traffic cost is 2 MiB regardless |
+| `RECONCILE_FINGERPRINT_BYTES` | `262144` | Bytes hashed at each end of a file when `/api/vault/verify` settles an ambiguous match. Telegram streams in 1 MiB chunks, so the traffic cost is 2 MiB regardless, and a value above 1 MiB is clamped to it. The effective value is published as `fingerprint_window_bytes` by `GET /api/catalog/freshness` |
+| `BACKUP_STATE_DB` | unset | Path to `scripts/backup_local_folder.py`'s own state DB. When set, `POST /api/catalog/scan` also attributes catalog rows to that script. Unset means only the worker's own provenance is matched |
 
 ## HTTP API
 
@@ -159,7 +160,7 @@ deleted — it does not delete.
 | Tier | Evidence |
 |---|---|
 | `HASH` | The entry's `sha256` equals a catalog row's whole-file hash. |
-| `FINGERPRINT` | Settled by `POST /api/vault/verify`: the head+tail hashes of the archived copy match the entry's own. |
+| `FINGERPRINT` | Settled by `POST /api/vault/verify`: the head+tail hashes of the archived copy match the entry's own **and** the archived copy's own size equals the entry's. Both halves are required — two files can share their first and last window and differ in the middle, and a size mismatch is the commonest reason an entry was `AMBIGUOUS` to begin with. |
 | `NAME_SIZE` | Filename and size match a catalog row, and the entry's `mtime` is not newer than the catalog's newest scanned message — otherwise the match is treated as possibly stale and the verdict falls back to `IN_FLIGHT` instead. |
 
 ### `GET /api/catalog/freshness`
@@ -168,13 +169,33 @@ How old the catalog is, so a client can judge whether to trust a
 `NOT_ARCHIVED` verdict or ask for a rescan first.
 
 ```json
-{"newest_message_date": "2026-07-20T00:00:00+00:00", "archive_rows": 4213}
+{"newest_message_date": "2026-07-01T00:00:00+00:00",
+ "archive_rows": 4213,
+ "fingerprint_window_bytes": 262144,
+ "channels": [
+   {"channel_id": -1002637897512, "newest_message_date": "2026-07-01T00:00:00+00:00", "rows": 4100},
+   {"channel_id": -1002900000001, "newest_message_date": "2026-07-20T00:00:00+00:00", "rows": 113}
+ ]}
 ```
 
 `archive_rows` is `0` before the first `POST /api/catalog/scan`. Only the two
 endpoints that call `evaluate` — `GET /api/vault/lookup` and `POST
 /api/devices/{device_id}/reconcile` — depend on a scanned catalog and answer
 `409` until then; the rest of the endpoints on this page don't.
+
+`newest_message_date` is the **oldest** of the per-channel frontiers, not the
+newest date anywhere. With more than one archive channel (`TELEGRAM_CHANNEL_ID`
+and `IPHONE_CHANNEL_ID` are both `archive`) a freshly scanned channel would
+otherwise drag the single number forward and let every stale channel's
+`NAME_SIZE` match pass the gate that exists to demote it. An archive channel
+with no catalogued rows has no frontier, so the whole value is `null` and every
+metadata match fails closed until it is scanned — `channels` is there to say
+which one that is.
+
+`fingerprint_window_bytes` is the window a client must hash at each end of a
+local file for `POST /api/vault/verify` to agree with it. It is the effective
+value of `RECONCILE_FINGERPRINT_BYTES` after clamping, so read it rather than
+assuming the default.
 
 ### `GET /api/vault/lookup`
 
@@ -247,7 +268,20 @@ retrievable later from `GET /api/devices/{device_id}/snapshot`.
 across every call made against this `snapshot_id`, including earlier ones —
 while `entries` covers only the files sent in *this* call. A client sending a
 large library in several calls should read progress from `summary`, not by
-summing `entries` across calls.
+summing `entries` across calls. `catalog` is the same object
+[`GET /api/catalog/freshness`](#get-apicatalogfreshness) returns, including the
+per-channel breakdown and `fingerprint_window_bytes`.
+
+**A `reconcile` call is not idempotent, and retrying one is not safe.** The
+snapshot counters are folded in by a read-modify-write with no lock, and
+findings carry no uniqueness constraint, so a call that is sent twice against
+the same open `snapshot_id` counts every entry in it twice and writes every
+finding in it twice. The summary is what the owner reads before deciding how
+much to delete, so a double-counted one is not a cosmetic problem. A client
+that cannot tell whether a call landed — a timeout, a dropped connection, any
+ambiguous outcome — must treat that as **fatal to the snapshot**: stop using
+that `snapshot_id`, start a new one with `snapshot_id: null`, and send the
+whole inventory again. Do not retry into an open snapshot.
 
 Refusals:
 - `413` — more entries than `RECONCILE_MAX_ENTRIES` in one call. Continue in
@@ -308,17 +342,41 @@ has already deleted the files.
 
 ### `POST /api/catalog/scan`
 
-Rescans every configured channel (`CatalogService.scan_all`), then matches
-against the worker's own DB and, if `BACKUP_STATE_DB` is set, against
-`scripts/backup_local_folder.py`'s state DB. This is what takes
-`archive_rows` above `0` — see [`GET /api/catalog/freshness`](#get-apicatalogfreshness)
-above for which endpoints that actually gates. `503` without a catalog
-service configured.
+Starts a **background** rescan of every configured channel
+(`CatalogService.scan_all`), which then matches against the worker's own DB
+and, if `BACKUP_STATE_DB` is set, against `scripts/backup_local_folder.py`'s
+state DB. This is what takes `archive_rows` above `0` — see
+[`GET /api/catalog/freshness`](#get-apicatalogfreshness) above for which
+endpoints that gates. A real channel is tens of thousands of messages of paced
+Telegram traffic, far longer than an HTTP client will wait, so the call returns
+immediately with a status snapshot and the work continues behind it. `409` if a
+scan is already running; `503` without a catalog service configured.
+
+Provenance is matched **per channel**, because message ids restart at `1` in
+every channel: worker rows are claimed only in `TELEGRAM_CHANNEL_ID`, and
+backup-script rows only in the channel recorded in that script's own
+`meta.channel_id`. A state DB that predates that record falls back to matching
+on `sha256` alone.
 
 ```json
-{"scanned": {"-1002637897512": {"scanned": 4213, "ingested": 12, "updated": 3}},
- "matched": {"worker": 4100, "backup_script": 113}}
+{"running": true, "activity": "scanning channel history", "last_error": null,
+ "result": null,
+ "channels": [{"channel_id": -1002637897512, "role": "ARCHIVE"}]}
 ```
+
+### `GET /api/catalog/status`
+
+The same snapshot, for polling a scan to completion. When one has finished,
+`running` is `false` and `result` holds what it did:
+
+```json
+{"running": false, "activity": null, "last_error": null,
+ "result": {"scanned": {"-1002637897512": {"scanned": 4213, "ingested": 12, "updated": 3}},
+            "matched": {"worker": 4100, "backup_script": 113}},
+ "channels": [{"channel_id": -1002637897512, "role": "ARCHIVE"}]}
+```
+
+`503` without a catalog service configured.
 
 ### `POST /api/catalog/resolve-manifests`
 
@@ -339,10 +397,21 @@ Settles one `AMBIGUOUS` entry by hashing `RECONCILE_FINGERPRINT_BYTES` bytes
 from each end of the archived copy — no download of the middle, ~2×
 `RECONCILE_FINGERPRINT_BYTES` of Telegram traffic regardless of file size —
 and comparing against the client's own head/tail hashes of the same window.
+Hash exactly the first and last `fingerprint_window_bytes` bytes of the local
+file, as [`GET /api/catalog/freshness`](#get-apicatalogfreshness) reports that
+number; for a file shorter than the window, both hashes are of the whole file.
 
 ```json
-{"match": true, "head_sha256": "…", "tail_sha256": "…"}
+{"match": true, "head_sha256": "…", "tail_sha256": "…", "archived_file_size": 4213556}
 ```
+
+`archived_file_size` is the size Telegram reports for the archived message's
+own media, read from the message and never echoed back from the request.
+**`match` is `true` only when both digests agree *and* `archived_file_size`
+equals the `file_size` sent** — that is the whole of tier `FINGERPRINT`, and
+the size half is what makes it evidence rather than a coincidence of two ends.
+A message carrying no sized media (a native `photo` mirror, say) reports
+`null` and can never match.
 
 `503` without a Telegram service configured. `404` — naming the channel and
 message — if the message is missing or has been deleted from the channel.
@@ -399,6 +468,35 @@ databases upgrade in place.
 **recovery_items** — `id`, `tg_message_id` (unique), `media_kind`,
 `file_name`, `file_size`, `message_date`, `status`, `local_path`, `sha256`,
 `planned_caption`, `new_tg_message_id`, `retry_count`, `error_log`, timestamps.
+
+**catalog_items** — one row per media message in one channel; the lookup
+surface for [device reconciliation](#device-reconciliation). `id`,
+`channel_id`, `tg_message_id`, `channel_role` (`ARCHIVE|MIRROR`), `media_kind`
+(`photo|video|animation|document`), `artifact` (`chunk|manifest`, else NULL),
+`file_name`, `file_size`, `mime_type`, `message_date`, `sha256`,
+`chunked_original_name`, `chunked_total_size`, `chunked_sha256` (the original a
+resolved manifest describes; NULL on every other row), `taken_at`, `gps_lat`,
+`gps_lon`, `width`, `height`, `camera_model`, `enriched_at`, `enrich_error`,
+`source` (`UNKNOWN|WORKER|BACKUP_SCRIPT`), `photo_id` (FK), `backup_rel_path`,
+`exported_path`, `exported_at`, timestamps. Unique on
+`(channel_id, tg_message_id)` — message ids restart at `1` in every channel, so
+the pair is the key and the bare id is not.
+
+**device_snapshots** — one reconciliation run for one device, aggregates only.
+`id`, `device_id`, `taken_at` (the client's clock, recorded and never trusted
+for logic), `completed_at`, `total_files`, `total_bytes`, and a files/bytes
+pair per verdict: `archived_*`, `in_flight_*`, `ambiguous_*`,
+`not_archived_*`, timestamps.
+
+**device_findings** — the non-`ARCHIVED` entries of a snapshot, the only ones
+worth a row per file. `id`, `snapshot_id` (FK, cascade), `relpath`,
+`file_name`, `file_size`, `verdict`, `reason`, `created_at`.
+
+**deletion_audits** — what a client reported deleting, and the message that
+holds the bytes. `id`, `device_id`, `relpath`, `file_name`, `file_size`,
+`tier`, `channel_id`, `tg_message_id`, `deleted_at` (the client's), `recorded_at`
+(the server's). Deliberately **no** foreign key to `device_snapshots`, so it
+outlives snapshot pruning: this is what makes a deletion reconstructible.
 
 ## Chunked-file formats
 

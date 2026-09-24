@@ -1,4 +1,5 @@
 """Catalog schema and channel scan."""
+import asyncio
 from datetime import datetime
 
 import pytest
@@ -89,6 +90,7 @@ async def test_the_same_message_id_in_two_channels_is_two_rows(clean_db):
 from types import SimpleNamespace
 
 from app.services.catalog import (
+    CatalogBusyError,
     CatalogService,
     ChannelSpec,
     channel_spec_or_none,
@@ -230,3 +232,93 @@ async def test_a_service_with_no_channels_scans_nothing_rather_than_erroring(cle
     """An unset IPHONE_CHANNEL_ID must be a no-op, not a crash on boot."""
     service = CatalogService(FakeClient({}), [])
     assert await service.scan_all() == {}
+
+
+# -- the scan as a background task, following RecoveryService's posture --------
+
+class GatedClient(FakeClient):
+    """Holds the history open until released, so 'running' can be observed."""
+
+    def __init__(self, history, entered, gate):
+        super().__init__(history)
+        self.entered = entered
+        self.gate = gate
+
+    async def get_chat_history(self, chat_id):
+        self.entered.set()
+        await self.gate.wait()
+        for message in self.history.get(chat_id, []):
+            yield message
+
+
+async def test_a_scan_runs_in_the_background_and_then_matches_provenance(clean_db):
+    """The real corpus is 18,294 messages across three channels — minutes of
+    paced traffic, far longer than any HTTP client waits."""
+    spec = ChannelSpec(-100, ChannelRole.ARCHIVE)
+    service = CatalogService(
+        FakeClient({-100: [_doc(1, "a.jpg")]}), [spec], worker_channel_id=-100
+    )
+
+    service.start_scan()
+    await service._task
+
+    snapshot = service.status_snapshot()
+    assert service.running is False
+    assert snapshot["last_error"] is None
+    assert snapshot["result"]["scanned"]["-100"]["ingested"] == 1
+    assert snapshot["result"]["matched"] == {"worker": 0, "backup_script": 0}
+
+    async with AsyncSessionLocal() as session:
+        assert (await session.scalar(select(CatalogItem))).file_name == "a.jpg"
+
+
+async def test_a_second_scan_while_one_is_running_is_refused(clean_db):
+    """Two concurrent scans would write the same rows from two directions, and
+    the reconcile endpoints would read the half-populated table meanwhile."""
+    entered, gate = asyncio.Event(), asyncio.Event()
+    spec = ChannelSpec(-100, ChannelRole.ARCHIVE)
+    service = CatalogService(
+        GatedClient({-100: [_doc(1, "a.jpg")]}, entered, gate), [spec], worker_channel_id=-100
+    )
+
+    service.start_scan()
+    await asyncio.wait_for(entered.wait(), timeout=2)
+    assert service.running is True
+    assert service.status_snapshot()["activity"] == "scanning channel history"
+
+    with pytest.raises(CatalogBusyError):
+        service.start_scan()
+
+    gate.set()
+    await service._task
+    assert service.running is False
+
+
+async def test_a_failing_scan_records_the_error_instead_of_vanishing(clean_db):
+    class BrokenClient:
+        async def get_chat_history(self, chat_id):
+            raise RuntimeError("telegram is down")
+            yield  # pragma: no cover - makes this an async generator
+
+    service = CatalogService(BrokenClient(), [ChannelSpec(-100, ChannelRole.ARCHIVE)])
+
+    service.start_scan()
+    await service._task
+
+    assert service.running is False
+    assert "telegram is down" in service.status_snapshot()["last_error"]
+
+
+async def test_shutdown_cancels_a_scan_that_is_still_running(clean_db):
+    """The lifespan tears the task down; a cancelled scan must not hang exit."""
+    entered, gate = asyncio.Event(), asyncio.Event()
+    spec = ChannelSpec(-100, ChannelRole.ARCHIVE)
+    service = CatalogService(
+        GatedClient({-100: [_doc(1, "a.jpg")]}, entered, gate), [spec]
+    )
+
+    service.start_scan()
+    await asyncio.wait_for(entered.wait(), timeout=2)
+    await service.shutdown()
+
+    assert service.running is False
