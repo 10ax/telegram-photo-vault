@@ -82,19 +82,26 @@ def decide(
     if pipeline_status is not None:
         if pipeline_status in IN_FLIGHT_STATUSES:
             return Decision(DeviceVerdict.IN_FLIGHT, reason="pipeline_in_progress")
-        if pipeline_status is PhotoStatus.FAILED:
+        if pipeline_status == PhotoStatus.FAILED:
             return Decision(DeviceVerdict.NOT_ARCHIVED, reason="pipeline_failed")
-        if pipeline_status is PhotoStatus.SKIPPED:
+        if pipeline_status == PhotoStatus.SKIPPED:
             return Decision(DeviceVerdict.NOT_ARCHIVED, reason="unsupported_type")
         # COMPLETED deliberately falls through: it is corroboration, not proof.
 
-    # 2. Content proof. Dates cannot undermine a hash.
+    # 2. Content proof. A matching hash promotes; a contradicting hash is
+    # disproof and disqualifies that candidate from every tier below HASH —
+    # a stale name+size match must never override positive evidence that the
+    # bytes differ.
+    contradicted: set[Candidate] = set()
     if sha256:
         for candidate in candidates:
-            if candidate.sha256 and candidate.sha256 == sha256:
-                return _archived(MatchTier.HASH, candidate)
+            if candidate.sha256:
+                if candidate.sha256 == sha256:
+                    return _archived(MatchTier.HASH, candidate)
+                contradicted.add(candidate)
 
-    exact_name = [c for c in candidates if c.file_name == name]
+    eligible = [c for c in candidates if c not in contradicted]
+    exact_name = [c for c in eligible if c.file_name == name]
 
     # 3. Metadata inference, which a stale catalog can undermine.
     if size > 0:
@@ -122,6 +129,16 @@ def decide(
             channel_id=exact_name[0].channel_id,
         )
 
+    contradicted_exact = [c for c in candidates if c in contradicted and c.file_name == name]
+    if contradicted_exact:
+        disproved = contradicted_exact[0]
+        return Decision(
+            DeviceVerdict.AMBIGUOUS,
+            reason="hash_mismatch",
+            tg_message_id=disproved.tg_message_id,
+            channel_id=disproved.channel_id,
+        )
+
     lowered = name.lower()
     for candidate in candidates:
         if candidate.file_name.lower() == lowered:
@@ -132,7 +149,7 @@ def decide(
                 channel_id=candidate.channel_id,
             )
 
-    if pipeline_status is PhotoStatus.COMPLETED:
+    if pipeline_status == PhotoStatus.COMPLETED:
         return Decision(
             DeviceVerdict.AMBIGUOUS, reason="completed_but_absent_from_catalog"
         )
@@ -150,7 +167,7 @@ def _newer_than_catalog(mtime: datetime | None, catalog_newest: datetime | None)
         mtime = mtime.replace(tzinfo=timezone.utc)
     if catalog_newest.tzinfo is None:
         catalog_newest = catalog_newest.replace(tzinfo=timezone.utc)
-    return mtime > catalog_newest
+    return mtime >= catalog_newest
 
 
 def _parse_mtime(value: object) -> datetime | None:
@@ -247,6 +264,7 @@ class ReconcileService:
                 select(CatalogItem).where(
                     CatalogItem.channel_role == ChannelRole.ARCHIVE,
                     CatalogItem.artifact == "manifest",
+                    CatalogItem.media_kind != "photo",
                     CatalogItem.chunked_original_name.isnot(None),
                     func.lower(CatalogItem.chunked_original_name).in_(lowered),
                 )
@@ -265,14 +283,28 @@ class ReconcileService:
         return {key: tuple(value) for key, value in found.items()}
 
     async def _pipeline_statuses(self, names: set[str]) -> dict[str, PhotoStatus]:
-        """The worker's state for each name, by the basename of its mega_path."""
+        """The worker's state for each name, by the basename of its mega_path.
+
+        `mega-ls -R` is recursive, so two subfolders can share a leaf name.
+        The overlay exists to veto, so a veto must never be shadowed by
+        corroboration: rows are walked in mega_path order and the first
+        non-COMPLETED status for a basename wins. COMPLETED is kept only
+        when every colliding row is COMPLETED.
+        """
         if not names:
             return {}
         async with AsyncSessionLocal() as session:
-            rows = await session.execute(select(Photo.mega_path, Photo.status))
+            rows = await session.execute(
+                select(Photo.mega_path, Photo.status).order_by(Photo.mega_path)
+            )
         statuses: dict[str, PhotoStatus] = {}
         for mega_path, status in rows:
             basename = mega_path.rsplit("/", 1)[-1]
-            if basename in names:
+            if basename not in names:
+                continue
+            existing = statuses.get(basename)
+            if existing is None or (
+                existing == PhotoStatus.COMPLETED and status != PhotoStatus.COMPLETED
+            ):
                 statuses[basename] = status
         return statuses

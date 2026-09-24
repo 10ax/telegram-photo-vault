@@ -153,3 +153,22 @@ def test_a_zero_byte_file_is_never_archived_by_name_and_size():
     result = _decide(name="empty.jpg", size=0, candidates=[empty])
     assert result.verdict is DeviceVerdict.AMBIGUOUS
     assert result.reason == "zero_byte_file"
+
+
+def test_a_contradicting_hash_is_ambiguous_never_archived():
+    """The server holds proof the bytes differ; a same name+size match must not override it."""
+    hashed = Candidate(1, -1, "movie.mp4", 5_000_000_000, "b" * 64)
+    result = _decide(
+        name="movie.mp4", size=5_000_000_000, sha256="a" * 64, candidates=[hashed]
+    )
+    assert result.verdict is DeviceVerdict.AMBIGUOUS
+    assert result.reason == "hash_mismatch"
+    assert result.tg_message_id == 1
+    assert result.channel_id == -1
+
+
+def test_an_unknown_catalog_freshness_fails_closed():
+    """No newest-message date on record is exactly as unsafe as a stale one."""
+    result = _decide(catalog_newest=None)
+    assert result.verdict is DeviceVerdict.IN_FLIGHT
+    assert result.reason == "catalog_older_than_file"

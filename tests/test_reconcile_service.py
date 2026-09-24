@@ -110,3 +110,29 @@ async def test_an_unscanned_catalog_refuses_to_answer(clean_db):
     """Answering from an empty table would read as 'nothing you own is backed up'."""
     with pytest.raises(CatalogNeverScanned):
         await ReconcileService().evaluate([_entry()])
+
+
+async def test_a_completed_row_never_shadows_a_veto_from_a_colliding_basename_a_then_b(clean_db):
+    """mega-ls -R is recursive: two subfolders can hold the same leaf name."""
+    await _row(tg_message_id=10, file_name="X.jpg", file_size=100)
+    async with AsyncSessionLocal() as session:
+        session.add(Photo(mega_path="/phone_bkp/a/X.jpg", status=PhotoStatus.COMPLETED))
+        session.add(Photo(mega_path="/phone_bkp/b/X.jpg", status=PhotoStatus.SKIPPED))
+        await session.commit()
+
+    [decision] = await ReconcileService().evaluate([_entry(name="X.jpg", size=100)])
+    assert decision.verdict is DeviceVerdict.NOT_ARCHIVED
+    assert decision.reason == "unsupported_type"
+
+
+async def test_a_completed_row_never_shadows_a_veto_from_a_colliding_basename_b_then_a(clean_db):
+    """Same collision, rows inserted in the opposite order: the outcome must not depend on it."""
+    await _row(tg_message_id=11, file_name="X.jpg", file_size=100)
+    async with AsyncSessionLocal() as session:
+        session.add(Photo(mega_path="/phone_bkp/b/X.jpg", status=PhotoStatus.SKIPPED))
+        session.add(Photo(mega_path="/phone_bkp/a/X.jpg", status=PhotoStatus.COMPLETED))
+        await session.commit()
+
+    [decision] = await ReconcileService().evaluate([_entry(name="X.jpg", size=100)])
+    assert decision.verdict is DeviceVerdict.NOT_ARCHIVED
+    assert decision.reason == "unsupported_type"
