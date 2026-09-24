@@ -172,3 +172,15 @@ def test_an_unknown_catalog_freshness_fails_closed():
     result = _decide(catalog_newest=None)
     assert result.verdict is DeviceVerdict.IN_FLIGHT
     assert result.reason == "catalog_older_than_file"
+
+
+def test_freshness_gate_false_returns_archived_where_the_default_waits():
+    """GET /api/vault/lookup has no local mtime to judge staleness with and
+    opts out of the gate explicitly, rather than the caller lying about
+    mtime. The default must remain unchanged (fail closed, as pinned by
+    test_a_missing_mtime_fails_closed above)."""
+    assert _decide(mtime=None).verdict is DeviceVerdict.IN_FLIGHT
+
+    opted_out = _decide(mtime=None, freshness_gate=False)
+    assert opted_out.verdict is DeviceVerdict.ARCHIVED
+    assert opted_out.tier is MatchTier.NAME_SIZE

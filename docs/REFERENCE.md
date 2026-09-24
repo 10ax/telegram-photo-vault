@@ -149,7 +149,7 @@ deleted — it does not delete.
 
 | Verdict | Meaning |
 |---|---|
-| `ARCHIVED` | The bytes are already in the archive channel. Safe to delete locally — the only verdict that authorises a deletion. |
+| `ARCHIVED` | The bytes are already in the archive channel. **Only the `ARCHIVED` verdict that `POST /api/devices/{device_id}/reconcile` returns authorises a deletion.** `GET /api/vault/lookup`'s `ARCHIVED` is informational only — see that endpoint below for why. |
 | `IN_FLIGHT` | The pipeline is still processing this file, or the catalog may be older than it. Wait and re-check. |
 | `AMBIGUOUS` | Partial evidence only (size mismatch, hash mismatch, case-only name match, zero-byte file, …). Resolve with `POST /api/vault/verify` or by eye. |
 | `NOT_ARCHIVED` | No credible match. Keep the file — the upload pipeline may have a gap. |
@@ -171,19 +171,26 @@ How old the catalog is, so a client can judge whether to trust a
 {"newest_message_date": "2026-07-20T00:00:00+00:00", "archive_rows": 4213}
 ```
 
-`archive_rows` is `0` before the first `POST /api/catalog/scan`; every other
-endpoint on this page answers `409` until then.
+`archive_rows` is `0` before the first `POST /api/catalog/scan`. Only the two
+endpoints that call `evaluate` — `GET /api/vault/lookup` and `POST
+/api/devices/{device_id}/reconcile` — depend on a scanned catalog and answer
+`409` until then; the rest of the endpoints on this page don't.
 
 ### `GET /api/vault/lookup`
 
-Query: `name`, `size`. A one-off spot check with no `mtime` or `sha256` — it
-answers only from the catalog, never from the worker's own pipeline state,
-and (having no local `mtime` to reason about) never fails closed on catalog
-freshness the way a real reconcile entry would.
+Query: `name`, `size`. A one-off spot check with no `mtime` or `sha256`. It
+still consults the worker's own pipeline state like a real reconcile entry
+does — a file with a `PENDING` photo row comes back `IN_FLIGHT` here too —
+but having no local `mtime` to judge staleness with, it explicitly opts out
+of the catalog-freshness check that protects a real reconcile entry's
+`NAME_SIZE` match from a stale catalog. The response says so
+(`"freshness_gate": false`) so a client can't miss it: **a lookup verdict is
+informational only, and never authorises a deletion by itself — only
+`POST /api/devices/{device_id}/reconcile`'s `ARCHIVED` does.**
 
 ```json
 {"verdict": "ARCHIVED", "tier": "NAME_SIZE", "reason": null,
- "channel_id": -1002637897512, "tg_message_id": 1}
+ "channel_id": -1002637897512, "tg_message_id": 1, "freshness_gate": false}
 ```
 
 `409` if the catalog has never been scanned.
@@ -236,12 +243,19 @@ of any library, and the only record of one that survives is a
 entries are additionally persisted as `device_findings` under the snapshot,
 retrievable later from `GET /api/devices/{device_id}/snapshot`.
 
+`summary` and `catalog` describe the *whole* snapshot to date — cumulative
+across every call made against this `snapshot_id`, including earlier ones —
+while `entries` covers only the files sent in *this* call. A client sending a
+large library in several calls should read progress from `summary`, not by
+summing `entries` across calls.
+
 Refusals:
 - `413` — more entries than `RECONCILE_MAX_ENTRIES` in one call. Continue in
   several calls, passing the `snapshot_id` the first call returned.
-- `409` — the catalog has never been scanned; or `snapshot_id` belongs to a
-  different `device_id`; or that snapshot is already closed (a previous call
-  against it sent `final: true`).
+- `404` — `snapshot_id` doesn't refer to any snapshot at all.
+- `409` — the catalog has never been scanned; or `snapshot_id` refers to a
+  snapshot that exists but belongs to a different `device_id`; or that
+  snapshot is already closed (a previous call against it sent `final: true`).
 
 ### `GET /api/devices/{device_id}/snapshot`
 
@@ -287,13 +301,19 @@ anything**; this is a log of what a client did, kept so a deletion stays
 traceable back to the channel message that justified it. Response:
 `{"recorded": 1}`.
 
+`tier` must be one of the three [match tiers](#match-tiers) above (`422` if
+not) — rejected before anything in the batch is considered audited, rather
+than losing the whole batch's audit partway through a loop after the client
+has already deleted the files.
+
 ### `POST /api/catalog/scan`
 
 Rescans every configured channel (`CatalogService.scan_all`), then matches
 against the worker's own DB and, if `BACKUP_STATE_DB` is set, against
 `scripts/backup_local_folder.py`'s state DB. This is what takes
-`archive_rows` above `0` and is the prerequisite for every other endpoint on
-this page. `503` without a catalog service configured.
+`archive_rows` above `0` — see [`GET /api/catalog/freshness`](#get-apicatalogfreshness)
+above for which endpoints that actually gates. `503` without a catalog
+service configured.
 
 ```json
 {"scanned": {"-1002637897512": {"scanned": 4213, "ingested": 12, "updated": 3}},

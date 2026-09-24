@@ -3,21 +3,29 @@ from __future__ import annotations
 import os
 import secrets
 import shutil
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from pydantic import BaseModel
 from sqlalchemy import func, select
 
-from app.models.database import AsyncSessionLocal, Photo, PhotoStatus, RecoveryItem, RecoveryStatus
-from app.services.recovery import RecoveryBusyError
+from app.models.database import (
+    AsyncSessionLocal,
+    MatchTier,
+    Photo,
+    PhotoStatus,
+    RecoveryItem,
+    RecoveryStatus,
+)
 from app.services.reconcile import (
     CatalogNeverScanned,
     ReconcileService,
     SnapshotConflict,
-    _parse_mtime,
+    SnapshotNotFound,
 )
+from app.services.recovery import RecoveryBusyError
+from app.services.telegram import ArchivedMessageMissing
 
 ERROR_LOG_PREVIEW_CHARS = 4000
 
@@ -334,7 +342,7 @@ class ReconcileEntry(BaseModel):
 class ReconcileRequest(BaseModel):
     entries: list[ReconcileEntry]
     snapshot_id: int | None = None
-    taken_at: str | None = None
+    taken_at: datetime | None = None
     # False while a client is sending a large library in several calls.
     final: bool = True
 
@@ -343,7 +351,7 @@ class DeletionRecord(BaseModel):
     relpath: str
     name: str
     size: int
-    tier: str
+    tier: MatchTier
     channel_id: int
     tg_message_id: int
     deleted_at: str | None = None
@@ -383,23 +391,17 @@ async def vault_lookup(
     size: int = Query(...),
 ) -> dict[str, object]:
     service = _require_reconcile(request)
-    entry = {
-        "relpath": name,
-        "name": name,
-        "size": size,
-        # This endpoint takes no local mtime, unlike a device's real inventory
-        # entries. decide() fails closed on an unknown mtime (treats it as
-        # newer than the catalog, to protect a real reconcile call from a
-        # stale NAME_SIZE match) — with mtime always None that gate would fire
-        # on every call and a plain name+size match could never come back
-        # ARCHIVED. Reporting the epoch instead means "not newer than the
-        # catalog" and lets a genuine match through; this lookup is
-        # informational only and never authorises a deletion by itself.
-        "mtime": datetime(1970, 1, 1, tzinfo=timezone.utc).isoformat(),
-        "sha256": None,
-    }
+    # This endpoint takes no local mtime, unlike a device's real inventory
+    # entries, so it has nothing honest to judge staleness with. Rather than
+    # substituting a fake timestamp to dodge decide()'s freshness gate, it
+    # opts out of that gate explicitly — freshness_gate=False is the actual
+    # rule being applied, not an implementation detail hidden in the data.
+    # This means a lookup ARCHIVED verdict is informational only: it carries
+    # none of the stale-catalog protection a real reconcile entry gets, and
+    # must never by itself authorise a deletion (see docs/REFERENCE.md).
+    entry = {"relpath": name, "name": name, "size": size, "mtime": None, "sha256": None}
     try:
-        [decision] = await service.evaluate([entry])
+        [decision] = await service.evaluate([entry], freshness_gate=False)
     except CatalogNeverScanned as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
     return {
@@ -408,6 +410,7 @@ async def vault_lookup(
         "reason": decision.reason,
         "channel_id": decision.channel_id,
         "tg_message_id": decision.tg_message_id,
+        "freshness_gate": False,
     }
 
 
@@ -430,11 +433,13 @@ async def device_reconcile(
             device_id,
             [entry.model_dump() for entry in payload.entries],
             snapshot_id=payload.snapshot_id,
-            taken_at=_parse_mtime(payload.taken_at),
+            taken_at=payload.taken_at,
             final=payload.final,
         )
     except CatalogNeverScanned as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+    except SnapshotNotFound as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
     except SnapshotConflict as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
 
@@ -504,10 +509,7 @@ async def vault_verify(request: Request, payload: VerifyRequest) -> dict[str, ob
             file_size=payload.file_size,
             window=service.fingerprint_bytes,
         )
-    except AttributeError:
-        # The client's real failure mode for a missing/deleted message: get_messages
-        # returns something stream_media cannot read, and it blows up with a bare
-        # AttributeError rather than a purpose-built error. Turn it into a 404.
+    except ArchivedMessageMissing:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=(

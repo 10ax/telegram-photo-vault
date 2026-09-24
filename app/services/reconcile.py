@@ -79,6 +79,7 @@ def decide(
     pipeline_status: PhotoStatus | None,
     candidates: Sequence[Candidate],
     catalog_newest: datetime | None,
+    freshness_gate: bool = True,
 ) -> Decision:
     """The verdict for one local file. Same inputs, same answer, always."""
     # 1. What the pipeline knows, which the catalog cannot know.
@@ -106,11 +107,13 @@ def decide(
     eligible = [c for c in candidates if c not in contradicted]
     exact_name = [c for c in eligible if c.file_name == name]
 
-    # 3. Metadata inference, which a stale catalog can undermine.
+    # 3. Metadata inference, which a stale catalog can undermine — unless the
+    # caller has explicitly opted out of that protection (freshness_gate=False),
+    # because it has no mtime to judge staleness with in the first place.
     if size > 0:
         for candidate in exact_name:
             if candidate.file_size == size:
-                if _newer_than_catalog(mtime, catalog_newest):
+                if freshness_gate and _newer_than_catalog(mtime, catalog_newest):
                     return Decision(
                         DeviceVerdict.IN_FLIGHT, reason="catalog_older_than_file"
                     )
@@ -182,8 +185,12 @@ def _parse_mtime(value: object) -> datetime | None:
         return None
 
 
+class SnapshotNotFound(RuntimeError):
+    """No snapshot exists with the given id at all."""
+
+
 class SnapshotConflict(RuntimeError):
-    """A continuation that does not belong to this device, or is already closed."""
+    """A snapshot that exists, but belongs to a different device or is already closed."""
 
 
 _VERDICT_COLUMNS = {
@@ -216,7 +223,9 @@ class ReconcileService:
             )
         return {"newest_message_date": newest, "archive_rows": int(rows or 0)}
 
-    async def evaluate(self, entries: Sequence[dict]) -> list[Decision]:
+    async def evaluate(
+        self, entries: Sequence[dict], *, freshness_gate: bool = True
+    ) -> list[Decision]:
         freshness = await self.catalog_freshness()
         if freshness["archive_rows"] == 0:
             raise CatalogNeverScanned(
@@ -238,6 +247,7 @@ class ReconcileService:
                     size=int(entry.get("size") or 0),
                     sha256=entry.get("sha256"),
                     mtime=_parse_mtime(entry.get("mtime")),
+                    freshness_gate=freshness_gate,
                     pipeline_status=statuses.get(name),
                     candidates=candidates.get(name.lower(), ()),
                     catalog_newest=catalog_newest,
@@ -258,8 +268,12 @@ class ReconcileService:
 
         ARCHIVED entries are returned and not stored: they are the bulk, and the
         only time anyone looks at one again is through the audit, once it is gone.
+
+        The freshness gate stays on here — unlike GET /api/vault/lookup, this
+        entry carries a real device mtime, so a stale-catalog demotion is
+        meaningful and must not be silently skipped.
         """
-        decisions = await self.evaluate(entries)
+        decisions = await self.evaluate(entries, freshness_gate=True)
 
         async with AsyncSessionLocal() as session:
             if snapshot_id is None:
@@ -268,14 +282,16 @@ class ReconcileService:
                 await session.flush()
             else:
                 snapshot = await session.get(DeviceSnapshot, snapshot_id)
-                if snapshot is None or snapshot.device_id != device_id:
+                if snapshot is None:
+                    raise SnapshotNotFound(f"No snapshot {snapshot_id}.")
+                if snapshot.device_id != device_id:
                     raise SnapshotConflict(
                         f"Snapshot {snapshot_id} does not belong to device {device_id!r}."
                     )
                 if snapshot.completed_at is not None:
                     raise SnapshotConflict(f"Snapshot {snapshot_id} is already closed.")
 
-            for entry, decision in zip(entries, decisions):
+            for entry, decision in zip(entries, decisions, strict=True):
                 size = int(entry.get("size") or 0)
                 snapshot.total_files += 1
                 snapshot.total_bytes += size
@@ -316,7 +332,7 @@ class ReconcileService:
                     "channel_id": decision.channel_id,
                     "tg_message_id": decision.tg_message_id,
                 }
-                for entry, decision in zip(entries, decisions)
+                for entry, decision in zip(entries, decisions, strict=True)
             ],
         }
 

@@ -108,6 +108,15 @@ async def build_caption(file_path: str | Path, fallback: datetime | None = None)
     return _format_caption(photo_datetime)
 
 
+class ArchivedMessageMissing(RuntimeError):
+    """The channel message fingerprint_message was asked for no longer exists.
+
+    get_messages returns None for a single missing/deleted id rather than
+    raising — silently proceeding would surface as a bare AttributeError deep
+    inside stream_media, which looks like (and could mask) an unrelated bug.
+    """
+
+
 class TelegramService:
     def __init__(
         self,
@@ -333,6 +342,10 @@ class TelegramService:
     ) -> dict[str, str]:
         """Fetch one archived message and fingerprint it."""
         message = await self.client.get_messages(channel_id, message_id)
+        if message is None:
+            raise ArchivedMessageMissing(
+                f"Message {message_id} in channel {channel_id} was not found or has been deleted."
+            )
         return await self.partial_fingerprint(message, file_size=file_size, window=window)
 
     async def _read_chunk(self, message, index: int) -> bytes:

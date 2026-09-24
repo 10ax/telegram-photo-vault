@@ -18,6 +18,7 @@ from app.models.database import (
     DeletionAudit,
 )
 from app.services.reconcile import ReconcileService
+from app.services.telegram import ArchivedMessageMissing
 
 ARCHIVE = -1002637897512
 KEY = "test-key"
@@ -34,12 +35,15 @@ class FakeTelegram:
 
 
 class MissingMessageTelegram:
-    """Reproduces the real client's failure mode for a missing/deleted message:
-    stream_media blows up with a bare AttributeError, not a purpose-built error.
+    """Reproduces the real service's contract for a missing/deleted message:
+    TelegramService.fingerprint_message raises ArchivedMessageMissing itself
+    (it checks get_messages's result for None), not a bare AttributeError.
     """
 
     async def fingerprint_message(self, channel_id, message_id, *, file_size, window):
-        raise AttributeError("'NoneType' object has no attribute 'stream_media'")
+        raise ArchivedMessageMissing(
+            f"Message {message_id} in channel {channel_id} was not found or has been deleted."
+        )
 
 
 @pytest.fixture
@@ -222,8 +226,8 @@ def test_verify_without_a_telegram_service_is_503(client):
 
 
 def test_verify_of_a_missing_message_is_404_not_500(client, app_state):
-    """The known issue: fingerprint_message raises a bare AttributeError when
-    the message is gone. The route must turn that into a 404, not a 500."""
+    """The known issue: a missing/deleted message must become a clean 404,
+    not the bare AttributeError the underlying client raises internally."""
     app_state.telegram = MissingMessageTelegram()
 
     response = _post(client, "/api/vault/verify", {
@@ -269,6 +273,8 @@ def test_scan_and_resolve_routes_reach_the_catalog_service(client, app_state):
 
 def test_the_catalog_routes_are_503_without_the_service(client):
     assert _post(client, "/api/catalog/scan", {}).status_code == 503
+    assert client.post("/api/catalog/resolve-manifests",
+                       headers={"X-Api-Key": KEY}).status_code == 503
 
 
 def test_catalog_freshness_reports_what_the_client_needs(client):
@@ -281,3 +287,58 @@ def test_lookup_answers_a_single_file(client):
     body = client.get("/api/vault/lookup", params={"name": "a.jpg", "size": 100},
                       headers={"X-Api-Key": KEY}).json()
     assert body["verdict"] == "ARCHIVED"
+    assert body["freshness_gate"] is False, "the lookup opts out and must say so"
+
+
+def test_reconcile_entry_missing_mtime_is_in_flight_not_a_guess(client):
+    """Unlike GET /api/vault/lookup, the reconcile path keeps the freshness
+    gate on — an entry with no mtime must not be silently promoted."""
+    entry = {"relpath": "DCIM/a.jpg", "name": "a.jpg", "size": 100, "sha256": None}
+    body = _post(client, "/api/devices/pixel/reconcile", {"entries": [entry]}).json()
+    assert body["entries"][0]["verdict"] == "IN_FLIGHT"
+
+
+def test_reconcile_against_an_unknown_snapshot_is_404(client):
+    """A snapshot id that does not exist at all is a 404, not a false claim
+    that it belongs to someone else."""
+    response = _post(client, "/api/devices/pixel/reconcile",
+                     {"entries": [_entry()], "snapshot_id": 999999})
+    assert response.status_code == 404
+
+
+def test_a_continuation_accumulates_bytes_not_just_file_counts(client):
+    first = _post(client, "/api/devices/pixel/reconcile",
+                  {"entries": [_entry()], "final": False}).json()
+    second = _post(client, "/api/devices/pixel/reconcile",
+                   {"entries": [_entry("missing.jpg", 5)],
+                    "snapshot_id": first["snapshot_id"], "final": True}).json()
+
+    assert second["summary"]["ARCHIVED"]["bytes"] == 100
+    assert second["summary"]["NOT_ARCHIVED"]["bytes"] == 5
+    assert second["summary"]["TOTAL"]["bytes"] == 105
+
+
+def test_snapshot_404s_for_a_device_with_no_history(client):
+    response = client.get("/api/devices/never-seen/snapshot", headers={"X-Api-Key": KEY})
+    assert response.status_code == 404
+
+
+def test_an_invalid_deletion_tier_is_422_and_nothing_is_audited(client):
+    """A typo in tier must be rejected before anything is considered audited —
+    not raise a raw ValueError after the client has already deleted the file."""
+    response = _post(client, "/api/devices/pixel/deletions", {
+        "deleted": [{
+            "relpath": "DCIM/a.jpg", "name": "a.jpg", "size": 100,
+            "tier": "NOT_A_REAL_TIER", "channel_id": ARCHIVE, "tg_message_id": 1,
+            "deleted_at": "2026-09-24T10:00:00Z",
+        }]
+    })
+    assert response.status_code == 422
+
+    async def read():
+        async with AsyncSessionLocal() as session:
+            from sqlalchemy import select
+
+            return list((await session.scalars(select(DeletionAudit))).all())
+
+    assert asyncio.run(read()) == []

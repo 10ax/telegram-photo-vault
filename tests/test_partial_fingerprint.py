@@ -2,7 +2,9 @@
 import hashlib
 from types import SimpleNamespace
 
-from app.services.telegram import TelegramService
+import pytest
+
+from app.services.telegram import ArchivedMessageMissing, TelegramService
 
 CHUNK = 1024 * 1024
 
@@ -82,6 +84,20 @@ async def test_fingerprint_message_fetches_the_message_then_hashes_it():
 
     assert client.asked == [(-100, 7)]
     assert result["head_sha256"] == hashlib.sha256(blob[:262_144]).hexdigest()
+
+
+async def test_fingerprint_message_raises_a_purpose_built_error_when_the_message_is_gone():
+    """get_messages returns None for a single missing/deleted id (real pyrogram
+    behaviour); this must surface as ArchivedMessageMissing, not propagate into
+    stream_media and blow up there as a bare, hard-to-attribute AttributeError."""
+
+    class MissingMessageClient(FakeClient):
+        async def get_messages(self, chat_id, message_ids):
+            return None
+
+    client = MissingMessageClient(b"")
+    with pytest.raises(ArchivedMessageMissing):
+        await _service(client).fingerprint_message(-100, 999, file_size=100)
 
 
 async def test_a_difference_in_the_tail_changes_the_fingerprint():
