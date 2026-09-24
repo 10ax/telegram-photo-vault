@@ -12,6 +12,8 @@
 
 **Depends on:** Tasks 1-3 of `docs/superpowers/plans/2026-09-21-catalog-and-immich-bridge.md` (the `CatalogItem` model, the multi-channel scan, provenance matching). It does **not** depend on that plan's enrich, report or gallery-export tasks. Those three tasks must be complete and committed before Task 1 here begins.
 
+**Scope amendment (decided at execution pre-flight).** The catalog plan puts `POST /api/catalog/scan` in its Task 5, alongside the enrichment report — outside the dependency above. Delivered without it, nothing could populate the catalog, so `evaluate` would raise `CatalogNeverScanned` forever and this feature would ship inert. Task 5 below therefore carries two routes that trigger work owned by earlier tasks: `/catalog/scan` (copied verbatim from catalog Task 5, so that task must not redefine it when it later runs) and `/catalog/resolve-manifests` (which gives Task 1's operation its caller).
+
 ## Global Constraints
 
 - **Nothing in this plan writes to Telegram, and nothing in it deletes anything anywhere.** The server emits verdicts; deleting local files is the client's job and no client is in scope. There is no `--apply` flag because there is no destructive mode.
@@ -71,7 +73,7 @@ Five failure modes the spec implies that no task's happy path exercises, most li
 | `app/services/catalog.py` | `resolve_manifests()`. |
 | `app/services/telegram.py` | `partial_fingerprint()`. |
 | `app/main.py` | Parse the two knobs, build `ReconcileService`, store it and the existing `TelegramService` on `app.state`. |
-| `app/api/routes.py` | Six endpoints. |
+| `app/api/routes.py` | Eight endpoints. |
 | `tests/test_db_migrations.py` | The three new tables on a legacy database. |
 | `docker-compose.yml`, `AGENTS.md`, `docs/REFERENCE.md` | Two knobs plus the manifest protocol, per the five-edit rule. |
 
@@ -1684,6 +1686,41 @@ def test_verify_without_a_telegram_service_is_503(client):
     assert response.status_code == 503
 
 
+def test_scan_and_resolve_routes_reach_the_catalog_service(client, app_state):
+    """Without these two, nothing could ever populate the catalog."""
+
+    class FakeCatalog:
+        def __init__(self):
+            self.calls = []
+
+        async def scan_all(self):
+            self.calls.append("scan_all")
+            return {"-100": {"scanned": 3, "ingested": 3, "updated": 0}}
+
+        async def match_all(self, state_db_path=None):
+            self.calls.append("match_all")
+            return {"worker": 0, "backup_script": 0}
+
+        async def resolve_manifests(self, limit=50):
+            self.calls.append(f"resolve_manifests:{limit}")
+            return {"resolved": 1, "failed": 0, "remaining": 0}
+
+    app_state.catalog = FakeCatalog()
+
+    scanned = _post(client, "/api/catalog/scan", {})
+    assert scanned.status_code == 200
+    assert scanned.json()["scanned"]["-100"]["ingested"] == 3
+
+    resolved = client.post("/api/catalog/resolve-manifests", params={"limit": 10},
+                           headers={"X-Api-Key": KEY})
+    assert resolved.json()["resolved"] == 1
+    assert app_state.catalog.calls == ["scan_all", "match_all", "resolve_manifests:10"]
+
+
+def test_the_catalog_routes_are_503_without_the_service(client):
+    assert _post(client, "/api/catalog/scan", {}).status_code == 503
+
+
 def test_catalog_freshness_reports_what_the_client_needs(client):
     body = client.get("/api/catalog/freshness", headers={"X-Api-Key": KEY}).json()
     assert body["archive_rows"] == 1
@@ -1940,7 +1977,7 @@ def _require_reconcile(request: Request) -> ReconcileService:
     return service
 ```
 
-And the six routes:
+And the eight routes:
 
 ```python
 @router.get("/catalog/freshness")
@@ -2018,6 +2055,32 @@ async def device_deletions(
     return {"recorded": recorded}
 
 
+def _require_catalog(request: Request):
+    catalog = getattr(request.app.state, "catalog", None)
+    if catalog is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Catalog service is not available.",
+        )
+    return catalog
+
+
+@router.post("/catalog/scan")
+async def catalog_scan(request: Request) -> dict[str, object]:
+    catalog = _require_catalog(request)
+    results = await catalog.scan_all()
+    matched = await catalog.match_all(os.getenv("BACKUP_STATE_DB") or None)
+    return {"scanned": results, "matched": matched}
+
+
+@router.post("/catalog/resolve-manifests")
+async def catalog_resolve_manifests(
+    request: Request, limit: int = Query(default=50, ge=1, le=500)
+) -> dict[str, int]:
+    """Give chunked originals their identity, so files above 2 GB become findable."""
+    return await _require_catalog(request).resolve_manifests(limit=limit)
+
+
 @router.post("/vault/verify")
 async def vault_verify(request: Request, payload: VerifyRequest) -> dict[str, object]:
     """Settle one AMBIGUOUS entry against the archived copy, for ~2 MiB of traffic."""
@@ -2078,7 +2141,7 @@ Add `from app.services.reconcile import ReconcileService` to the imports.
 - [ ] **Step 7: Run the tests to verify they pass**
 
 Run: `.venv/bin/python -m pytest tests/test_reconcile_api.py -q`
-Expected: PASS, 14 tests.
+Expected: PASS, 16 tests.
 
 - [ ] **Step 8: Run the whole suite, the linter and the compile check**
 
