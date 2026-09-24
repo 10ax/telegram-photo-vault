@@ -11,7 +11,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import sqlite3
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Sequence
 
 from sqlalchemy import select
@@ -19,7 +21,9 @@ from sqlalchemy import select
 from app.models.database import (
     AsyncSessionLocal,
     CatalogItem,
+    CatalogSource,
     ChannelRole,
+    Photo,
 )
 
 logger = logging.getLogger(__name__)
@@ -201,3 +205,105 @@ class CatalogService:
                 await session.commit()
                 return "updated"
             return "unchanged"
+
+    async def match_worker(self) -> int:
+        """Attribute rows to the MEGA worker by tg_message_id.
+
+        photos.tg_message_id is unique per archive channel, so this is an exact
+        join; there is no sha256 fallback because the worker never re-uploads a
+        file under a new message without also updating its row.
+        """
+        matched = 0
+        async with AsyncSessionLocal() as session:
+            photos = {
+                photo.tg_message_id: photo
+                for photo in (
+                    await session.scalars(select(Photo).where(Photo.tg_message_id.is_not(None)))
+                ).all()
+            }
+            if not photos:
+                return 0
+
+            items = (
+                await session.scalars(
+                    select(CatalogItem).where(CatalogItem.source == CatalogSource.UNKNOWN)
+                )
+            ).all()
+
+            for item in items:
+                photo = photos.get(item.tg_message_id)
+                if photo is None:
+                    continue
+                item.source = CatalogSource.WORKER
+                item.photo_id = photo.id
+                if item.sha256 is None:
+                    item.sha256 = photo.sha256
+                matched += 1
+
+            if matched:
+                await session.commit()
+        return matched
+
+    async def match_backup_db(self, state_db_path: str | Path) -> int:
+        """Attribute rows to scripts/backup_local_folder.py.
+
+        That script keeps its own stdlib sqlite3 state DB, never the app's, so
+        this reads it directly and read-only. A missing file is a normal
+        configuration state, not an error: report zero and move on.
+        """
+        path = Path(state_db_path)
+        if not path.exists():
+            logger.info("Catalog match: no backup state DB at %s, skipping.", path)
+            return 0
+
+        try:
+            conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+            try:
+                rows = conn.execute(
+                    "SELECT rel_path, sha256, tg_message_id FROM files "
+                    "WHERE tg_message_id IS NOT NULL"
+                ).fetchall()
+            finally:
+                conn.close()
+        except sqlite3.Error as exc:
+            logger.warning("Catalog match: could not read backup state DB at %s: %s", path, exc)
+            return 0
+
+        by_message = {int(mid): (rel, sha) for rel, sha, mid in rows}
+        by_sha = {sha: (rel, int(mid)) for rel, sha, mid in rows if sha}
+
+        matched = 0
+        async with AsyncSessionLocal() as session:
+            items = (
+                await session.scalars(
+                    select(CatalogItem).where(CatalogItem.source == CatalogSource.UNKNOWN)
+                )
+            ).all()
+
+            for item in items:
+                hit = by_message.get(item.tg_message_id)
+                if hit is not None:
+                    rel_path, sha = hit
+                elif item.sha256 and item.sha256 in by_sha:
+                    rel_path, _ = by_sha[item.sha256]
+                    sha = item.sha256
+                else:
+                    continue
+
+                item.source = CatalogSource.BACKUP_SCRIPT
+                item.backup_rel_path = rel_path
+                if item.sha256 is None:
+                    item.sha256 = sha
+                matched += 1
+
+            if matched:
+                await session.commit()
+        return matched
+
+    async def match_all(self, state_db_path: str | Path | None = None) -> dict[str, int]:
+        return {
+            "worker": await self.match_worker(),
+            "backup_script": (
+                await self.match_backup_db(state_db_path) if state_db_path else 0
+            ),
+        }
