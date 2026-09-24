@@ -129,3 +129,78 @@ def test_every_migration_target_exists_on_its_model():
     for table, columns in _COLUMN_MIGRATIONS.items():
         mapped = {column.name for column in tables[table].__table__.columns}
         assert set(columns) <= mapped, f"{table}: {set(columns) - mapped}"
+
+
+LEGACY_CATALOG_ITEMS = """
+CREATE TABLE catalog_items (
+    id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+    channel_id BIGINT NOT NULL,
+    tg_message_id BIGINT NOT NULL,
+    channel_role VARCHAR(8) NOT NULL,
+    media_kind VARCHAR(32) NOT NULL,
+    artifact VARCHAR(16),
+    file_name VARCHAR(512),
+    file_size BIGINT,
+    message_date DATETIME,
+    sha256 VARCHAR(64),
+    source VARCHAR(16) NOT NULL,
+    created_at DATETIME NOT NULL,
+    updated_at DATETIME NOT NULL
+)
+"""
+
+
+async def test_device_tables_are_created_on_a_legacy_database():
+    """The three device tables appear on a database that predates them."""
+    try:
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.drop_all)
+            await conn.exec_driver_sql(LEGACY_PHOTOS)
+
+        await init_db()
+
+        async with engine.begin() as conn:
+            for table in ("device_snapshots", "device_findings", "deletion_audits"):
+                result = await conn.exec_driver_sql(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,)
+                )
+                assert result.fetchone() is not None, f"{table} was not created"
+    finally:
+        await engine.dispose()
+
+
+async def test_catalog_items_gains_the_chunked_columns_in_place():
+    """A catalog_items written before this feature is upgraded, not rebuilt."""
+    try:
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.drop_all)
+            await conn.exec_driver_sql(LEGACY_CATALOG_ITEMS)
+            await conn.exec_driver_sql(
+                "INSERT INTO catalog_items "
+                "(channel_id, tg_message_id, channel_role, media_kind, source, "
+                " file_name, created_at, updated_at) "
+                "VALUES (-1, 1, 'ARCHIVE', 'document', 'UNKNOWN', 'keep.jpg', "
+                " '2026-01-01', '2026-01-01')"
+            )
+
+        await init_db()
+
+        async with engine.begin() as conn:
+            info = await conn.exec_driver_sql("PRAGMA table_info(catalog_items)")
+            columns = {row[1] for row in info.fetchall()}
+            assert {"chunked_original_name", "chunked_total_size", "chunked_sha256"} <= columns
+
+            rows = await conn.exec_driver_sql("SELECT file_name FROM catalog_items")
+            assert [r[0] for r in rows.fetchall()] == ["keep.jpg"], "existing rows survive"
+    finally:
+        await engine.dispose()
+
+
+async def test_every_new_column_is_nullable_or_defaulted():
+    """The additive rule: ALTER TABLE ADD COLUMN cannot add a bare NOT NULL."""
+    for table, columns in _COLUMN_MIGRATIONS.items():
+        for name, ddl in columns.items():
+            upper = ddl.upper()
+            assert "NOT NULL" not in upper or "DEFAULT" in upper, (
+                f"{table}.{name} is NOT NULL without a DEFAULT: {ddl}"
+            )

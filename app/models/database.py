@@ -59,6 +59,32 @@ class RecoveryStatus(str, Enum):
     FAILED = "FAILED"
 
 
+class DeviceVerdict(str, Enum):
+    """What a client may do with a local file.
+
+    Only ARCHIVED authorises a deletion. The other three all mean "keep it",
+    and differ in what the owner should do next: wait, decide, or investigate.
+    """
+
+    ARCHIVED = "ARCHIVED"
+    IN_FLIGHT = "IN_FLIGHT"
+    AMBIGUOUS = "AMBIGUOUS"
+    NOT_ARCHIVED = "NOT_ARCHIVED"
+
+
+class MatchTier(str, Enum):
+    """How strong the evidence behind an ARCHIVED verdict is.
+
+    HASH and FINGERPRINT are statements about content. NAME_SIZE is an
+    inference from metadata, which is why it is the only tier the catalog's
+    freshness can undermine.
+    """
+
+    HASH = "HASH"
+    FINGERPRINT = "FINGERPRINT"
+    NAME_SIZE = "NAME_SIZE"
+
+
 class Photo(Base):
     __tablename__ = "photos"
 
@@ -171,6 +197,90 @@ class RecoveryItem(Base):
         server_default=func.now(),
         onupdate=func.now(),
         nullable=False,
+    )
+
+
+class DeviceSnapshot(Base):
+    """One reconciliation run for one device: aggregates only.
+
+    The ARCHIVED entries are the bulk and are deliberately not stored — they go
+    back to the client in the response and, once acted on, survive here only as
+    rows in deletion_audits.
+    """
+
+    __tablename__ = "device_snapshots"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    device_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    # The client's own clock, recorded as reported and never trusted for logic.
+    taken_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    total_files: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    total_bytes: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
+    archived_files: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    archived_bytes: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
+    in_flight_files: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    in_flight_bytes: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
+    ambiguous_files: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    ambiguous_bytes: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
+    not_archived_files: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    not_archived_bytes: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
+class DeviceFinding(Base):
+    """A local file that is not ARCHIVED — the only rows worth keeping per file."""
+
+    __tablename__ = "device_findings"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    snapshot_id: Mapped[int] = mapped_column(
+        ForeignKey("device_snapshots.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    relpath: Mapped[str] = mapped_column(String(1024), nullable=False)
+    file_name: Mapped[str] = mapped_column(String(512), nullable=False)
+    file_size: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    verdict: Mapped[DeviceVerdict] = mapped_column(
+        SqlEnum(DeviceVerdict, name="device_verdict", native_enum=False),
+        nullable=False,
+        index=True,
+    )
+    reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class DeletionAudit(Base):
+    """A local file the client reported deleting, and the message that holds it.
+
+    Permanent, and deliberately without a foreign key to device_snapshots: it
+    has to outlive snapshot pruning. This is what makes a deletion recoverable
+    — from the channel, without this database.
+    """
+
+    __tablename__ = "deletion_audits"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    device_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    relpath: Mapped[str] = mapped_column(String(1024), nullable=False)
+    file_name: Mapped[str] = mapped_column(String(512), nullable=False)
+    file_size: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    tier: Mapped[MatchTier] = mapped_column(
+        SqlEnum(MatchTier, name="match_tier", native_enum=False), nullable=False
+    )
+    channel_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    tg_message_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    recorded_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
     )
 
 
