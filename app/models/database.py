@@ -9,6 +9,7 @@ from sqlalchemy import (
     Boolean,
     DateTime,
     Enum as SqlEnum,
+    Float,
     ForeignKey,
     Integer,
     String,
@@ -162,6 +163,92 @@ class RecoveryItem(Base):
     browse_tg_message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     retry_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     error_log: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+
+class ChannelRole(str, Enum):
+    """What a channel is for.
+
+    ARCHIVE holds originals and is a gallery source. MIRROR holds native
+    Telegram copies of things already archived elsewhere: it is scanned so the
+    report can show drift, and is never enriched or exported.
+    """
+
+    ARCHIVE = "ARCHIVE"
+    MIRROR = "MIRROR"
+
+
+class CatalogSource(str, Enum):
+    WORKER = "WORKER"
+    BACKUP_SCRIPT = "BACKUP_SCRIPT"
+    UNKNOWN = "UNKNOWN"
+
+
+class CatalogItem(Base):
+    """One media message in one channel.
+
+    The channel is the archive; this table is a cache of what we know about it.
+    That is why the key is the message and not a local path: a row can only be
+    created by seeing the message, and a row that stops matching a message is
+    exactly the signal the reconciliation report exists to surface.
+    """
+
+    __tablename__ = "catalog_items"
+    __table_args__ = (
+        UniqueConstraint("channel_id", "tg_message_id", name="uq_catalog_channel_message"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    channel_id: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
+    tg_message_id: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
+    channel_role: Mapped[ChannelRole] = mapped_column(
+        SqlEnum(ChannelRole, name="channel_role", native_enum=False),
+        default=ChannelRole.ARCHIVE,
+        nullable=False,
+    )
+
+    media_kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    # Per-message classification: a chunked upload is N "chunk" rows plus one
+    # "manifest" row. Counting those as N+1 photos would corrupt every number in
+    # the report, so they are labelled here and excluded by the counters.
+    artifact: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    file_name: Mapped[str | None] = mapped_column(String(512), nullable=True, index=True)
+    file_size: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    # When it was posted, which for a migrated archive is not when it was shot.
+    message_date: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    sha256: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+
+    taken_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    gps_lat: Mapped[float | None] = mapped_column(Float, nullable=True)
+    gps_lon: Mapped[float | None] = mapped_column(Float, nullable=True)
+    width: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    height: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    camera_model: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # NULL means never attempted. Set even on failure, so a permanently
+    # unreadable file costs one fetch rather than one per run, forever.
+    enriched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    enrich_error: Mapped[str | None] = mapped_column(String(255), nullable=True)
+
+    source: Mapped[CatalogSource] = mapped_column(
+        SqlEnum(CatalogSource, name="catalog_source", native_enum=False),
+        default=CatalogSource.UNKNOWN,
+        nullable=False,
+        index=True,
+    )
+    photo_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("photos.id"), nullable=True)
+    backup_rel_path: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+
+    exported_path: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    exported_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
