@@ -139,11 +139,21 @@ For the same reason a `media_kind = 'photo'` row is never proof, in any channel.
 | tier | condition | verdict |
 |---|---|---|
 | A | local `sha256` equals `catalog_items.sha256` | `ARCHIVED` |
+| A (negative) | local `sha256` **differs** from a known candidate `sha256` | that candidate is disqualified from every tier below |
 | B | `file_name` and `file_size` both exact | `ARCHIVED` |
 | C | name matches, size differs | `AMBIGUOUS` (`size_mismatch`) |
 | C | name matches only case-insensitively | `AMBIGUOUS` (`case_only_match`) |
 | A- | partial fingerprint and size both equal (see below) | `ARCHIVED` |
+| C | name and size match, but the candidate's known hash differs | `AMBIGUOUS` (`hash_mismatch`) |
 | — | no name match | `NOT_ARCHIVED` |
+
+A hash is not only a promotion. When the catalog knows a candidate's content hash and it
+disagrees with the local file's, that is **disproof**, and disproof outranks the metadata
+inference below it: the name and the size may still match exactly while the bytes differ, and
+archiving on that evidence would delete a file the archive does not hold. The candidate is
+disqualified rather than merely not-promoted, and the entry is reported as `hash_mismatch` with
+the message to look at — same name, same size, different content is exactly what a human should
+see.
 
 `/sdcard` is case-insensitive and Telegram is not, which is why a case-only match is
 reported rather than trusted.

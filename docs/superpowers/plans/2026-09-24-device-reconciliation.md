@@ -40,6 +40,15 @@
 
 3. *What the freshness rule demotes.* The spec said an entry newer than the catalog "cannot be `ARCHIVED`". That rule exists because a name-and-size match is a metadata inference, and a stale catalog makes inference unsound. A hash match is not an inference — if the content hash is in the catalog, the bytes are in the channel, whatever the dates say. So the freshness rule demotes `NAME_SIZE` matches only, and leaves `HASH` and `FINGERPRINT` alone. Being conservative about proof would cost the user deletions they are entitled to, and buy nothing.
 
+4. *A hash is also a veto, decided during the Task 3 review.* Refinement 3 said a hash cannot be
+undermined by dates; the converse was missing and mattered more. When the catalog knows a
+candidate's content hash and it **differs** from the local file's, that candidate is disqualified
+from every tier below `HASH` — not merely left unpromoted. Without that, a name-and-size match
+archives a file the server has already proved it does not hold, which is the precise failure this
+feature exists to prevent. Such an entry is reported as `AMBIGUOUS` with reason `hash_mismatch`,
+carrying the message id, because same name and same size with different content is exactly what a
+human must look at.
+
 ## Review Focus
 
 Five failure modes the spec implies that no task's happy path exercises, most likely to bite first. Each one's test is placed in the task that owns the code.
