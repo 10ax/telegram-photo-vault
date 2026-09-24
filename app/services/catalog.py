@@ -9,6 +9,7 @@ is owned by other operations and is never cleared by a rescan.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import sqlite3
@@ -16,7 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from app.models.database import (
     AsyncSessionLocal,
@@ -33,6 +34,10 @@ logger = logging.getLogger(__name__)
 # as photos by anything downstream.
 CHUNK_PART_RE = re.compile(r"\.part\d+-of-\d+$")
 MANIFEST_SUFFIX = ".manifest.json"
+# Same contract as app/services/chunking.py's MANIFEST_KIND: the "kind" field
+# a manifest this repo wrote always carries. A payload with any other value
+# (or none) is not a manifest we produced.
+MANIFEST_KIND = "telegram-photo-vault/chunked-file"
 
 PROGRESS_EVERY = 500
 
@@ -46,6 +51,28 @@ def classify_artifact(file_name: str | None) -> str | None:
     if stem.endswith(MANIFEST_SUFFIX):
         return "manifest"
     return None
+
+
+def parse_manifest(payload: bytes) -> tuple[str, int, str]:
+    """(original_filename, total_size, sha256) from a manifest's bytes.
+
+    Raises ValueError on anything that is not a manifest this repo wrote. The
+    on-channel format is a contract: read it strictly rather than guessing.
+    """
+    document = json.loads(payload.decode("utf-8"))
+    if document.get("kind") != MANIFEST_KIND:
+        raise ValueError(f"not a chunked-file manifest: kind={document.get('kind')!r}")
+
+    name = document["original_filename"]
+    total_size = document["total_size"]
+    sha256 = document["sha256"]
+    if not isinstance(name, str) or not name:
+        raise ValueError("original_filename missing or empty")
+    if not isinstance(total_size, int) or total_size <= 0:
+        raise ValueError(f"total_size not a positive integer: {total_size!r}")
+    if not isinstance(sha256, str) or len(sha256) != 64:
+        raise ValueError(f"sha256 not a 64-character digest: {sha256!r}")
+    return name, total_size, sha256
 
 
 @dataclass(frozen=True)
@@ -149,6 +176,62 @@ class CatalogService:
             if self.scan_delay_seconds > 0:
                 await asyncio.sleep(self.scan_delay_seconds)
         return results
+
+    async def resolve_manifests(self, limit: int = 50) -> dict[str, int]:
+        """Read unresolved manifests and record the original each one describes.
+
+        Bounded and resumable like every other loop that touches Telegram. A
+        manifest that cannot be parsed records the reason and is never retried:
+        one fetch per broken file, not one per run forever.
+        """
+        archive_ids = [int(spec.channel_id) for spec in self.archive_channels]
+        if not archive_ids:
+            return {"resolved": 0, "failed": 0, "remaining": 0}
+
+        pending = (
+            select(CatalogItem)
+            .where(
+                CatalogItem.artifact == "manifest",
+                CatalogItem.channel_id.in_(archive_ids),
+                CatalogItem.chunked_original_name.is_(None),
+                CatalogItem.enrich_error.is_(None),
+            )
+            .order_by(CatalogItem.id)
+        )
+
+        async with AsyncSessionLocal() as session:
+            rows = list((await session.scalars(pending.limit(limit))).all())
+
+        resolved = failed = 0
+        for row in rows:
+            try:
+                message = await self.client.get_messages(row.channel_id, row.tg_message_id)
+                buffer = await self.client.download_media(message, in_memory=True)
+                name, total_size, sha256 = parse_manifest(buffer.getvalue())
+            except Exception as exc:  # noqa: BLE001 - recorded, not raised
+                failed += 1
+                async with AsyncSessionLocal() as session:
+                    item = await session.get(CatalogItem, row.id)
+                    item.enrich_error = f"manifest unreadable: {exc}"[:255]
+                    await session.commit()
+            else:
+                resolved += 1
+                async with AsyncSessionLocal() as session:
+                    item = await session.get(CatalogItem, row.id)
+                    item.chunked_original_name = name
+                    item.chunked_total_size = total_size
+                    item.chunked_sha256 = sha256
+                    await session.commit()
+
+            if self.scan_delay_seconds > 0:
+                await asyncio.sleep(self.scan_delay_seconds)
+
+        async with AsyncSessionLocal() as session:
+            remaining = await session.scalar(
+                select(func.count()).select_from(pending.subquery())
+            )
+
+        return {"resolved": resolved, "failed": failed, "remaining": int(remaining or 0)}
 
     async def _upsert(
         self,

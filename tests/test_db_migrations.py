@@ -8,6 +8,7 @@ defaulted — an existing SQLite file is upgraded in place, never rebuilt.
 from app.models.database import (
     _COLUMN_MIGRATIONS,
     Base,
+    CatalogItem,
     Photo,
     RecoveryItem,
     UploadChunk,
@@ -124,7 +125,7 @@ async def test_migrated_columns_are_all_nullable_or_defaulted():
 
 def test_every_migration_target_exists_on_its_model():
     """A typo in _COLUMN_MIGRATIONS would add a column nothing ever reads."""
-    tables = {"photos": Photo, "recovery_items": RecoveryItem}
+    tables = {"photos": Photo, "recovery_items": RecoveryItem, "catalog_items": CatalogItem}
     for table, columns in _COLUMN_MIGRATIONS.items():
         mapped = {column.name for column in tables[table].__table__.columns}
         assert set(columns) <= mapped, f"{table}: {set(columns) - mapped}"

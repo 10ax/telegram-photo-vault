@@ -227,6 +227,16 @@ class CatalogItem(Base):
     message_date: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     sha256: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
 
+    # A chunked upload appears as N "chunk" messages plus one "manifest" message.
+    # The manifest's payload describes the logical original, so its identity is
+    # stored here, on the row for the message that carries that description.
+    # NULL on every row that is not a resolved manifest.
+    chunked_original_name: Mapped[str | None] = mapped_column(
+        String(512), nullable=True, index=True
+    )
+    chunked_total_size: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    chunked_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+
     taken_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     gps_lat: Mapped[float | None] = mapped_column(Float, nullable=True)
     gps_lon: Mapped[float | None] = mapped_column(Float, nullable=True)
@@ -276,6 +286,11 @@ _COLUMN_MIGRATIONS: dict[str, dict[str, str]] = {
     },
     "recovery_items": {
         "browse_tg_message_id": "BIGINT",
+    },
+    "catalog_items": {
+        "chunked_original_name": "VARCHAR(512)",
+        "chunked_total_size": "BIGINT",
+        "chunked_sha256": "VARCHAR(64)",
     },
 }
 
