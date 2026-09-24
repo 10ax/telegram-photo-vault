@@ -26,6 +26,7 @@ from app.models.database import (
     ChannelRole,
     Photo,
 )
+from app.services.chunking import MANIFEST_KIND
 
 logger = logging.getLogger(__name__)
 
@@ -34,10 +35,6 @@ logger = logging.getLogger(__name__)
 # as photos by anything downstream.
 CHUNK_PART_RE = re.compile(r"\.part\d+-of-\d+$")
 MANIFEST_SUFFIX = ".manifest.json"
-# Same contract as app/services/chunking.py's MANIFEST_KIND: the "kind" field
-# a manifest this repo wrote always carries. A payload with any other value
-# (or none) is not a manifest we produced.
-MANIFEST_KIND = "telegram-photo-vault/chunked-file"
 
 PROGRESS_EVERY = 500
 
