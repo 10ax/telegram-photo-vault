@@ -5,9 +5,11 @@ Technical reference for Telegram Photo Vault. For setup and workflows, see the
 
 - [Environment variables](#environment-variables)
 - [HTTP API](#http-api)
+- [Device reconciliation](#device-reconciliation)
 - [State machines](#state-machines)
 - [Database schema](#database-schema)
 - [Chunked-file formats](#chunked-file-formats)
+- [Device inventory manifest](#device-inventory-manifest)
 - [vault_merge CLI](#vault_merge-cli)
 
 ## Environment variables
@@ -55,6 +57,8 @@ Technical reference for Telegram Photo Vault. For setup and workflows, see the
 | `DATA_VOLUME_PATH` | `/data` | Disk reported by `/api/system` |
 | `IPHONE_CHANNEL_ID` | unset | Third channel to catalogue, created by `scripts/backup_local_folder.py`. Its id is in the `meta` table of that script's state DB. Unset means the channel is skipped. |
 | `CATALOG_SCAN_DELAY` | `2` | Seconds between channels during a full scan |
+| `RECONCILE_MAX_ENTRIES` | `10000` | Inventory entries accepted per `reconcile` call; more is refused with `413` and a message telling the client to continue against the same `snapshot_id` |
+| `RECONCILE_FINGERPRINT_BYTES` | `262144` | Bytes hashed at each end of a file when `/api/vault/verify` settles an ambiguous match. Telegram streams in 1 MiB chunks, so the traffic cost is 2 MiB regardless |
 
 ## HTTP API
 
@@ -130,6 +134,198 @@ Items include `tg_message_id`, `media_kind`, `file_name`, `file_size`,
 ### `GET /api/system`
 
 `{"path": "/data", "total_bytes": …, "used_bytes": …, "free_bytes": …, "used_percent": 42.13}`
+
+## Device reconciliation
+
+A phone-side client (Termux script, adb script, Android app — none of which
+exist in this repo) builds an [inventory manifest](#device-inventory-manifest)
+of its local files, asks the server for a verdict on each, and only ever
+deletes a file the server called `ARCHIVED`. **Nothing here writes to
+Telegram, and the server never deletes anything**: `POST
+/api/devices/{device_id}/deletions` records what a client says it already
+deleted — it does not delete.
+
+### Verdicts
+
+| Verdict | Meaning |
+|---|---|
+| `ARCHIVED` | The bytes are already in the archive channel. Safe to delete locally — the only verdict that authorises a deletion. |
+| `IN_FLIGHT` | The pipeline is still processing this file, or the catalog may be older than it. Wait and re-check. |
+| `AMBIGUOUS` | Partial evidence only (size mismatch, hash mismatch, case-only name match, zero-byte file, …). Resolve with `POST /api/vault/verify` or by eye. |
+| `NOT_ARCHIVED` | No credible match. Keep the file — the upload pipeline may have a gap. |
+
+### Match tiers
+
+| Tier | Evidence |
+|---|---|
+| `HASH` | The entry's `sha256` equals a catalog row's whole-file hash. |
+| `FINGERPRINT` | Settled by `POST /api/vault/verify`: the head+tail hashes of the archived copy match the entry's own. |
+| `NAME_SIZE` | Filename and size match a catalog row, and the entry's `mtime` is not newer than the catalog's newest scanned message — otherwise the match is treated as possibly stale and the verdict falls back to `IN_FLIGHT` instead. |
+
+### `GET /api/catalog/freshness`
+
+How old the catalog is, so a client can judge whether to trust a
+`NOT_ARCHIVED` verdict or ask for a rescan first.
+
+```json
+{"newest_message_date": "2026-07-20T00:00:00+00:00", "archive_rows": 4213}
+```
+
+`archive_rows` is `0` before the first `POST /api/catalog/scan`; every other
+endpoint on this page answers `409` until then.
+
+### `GET /api/vault/lookup`
+
+Query: `name`, `size`. A one-off spot check with no `mtime` or `sha256` — it
+answers only from the catalog, never from the worker's own pipeline state,
+and (having no local `mtime` to reason about) never fails closed on catalog
+freshness the way a real reconcile entry would.
+
+```json
+{"verdict": "ARCHIVED", "tier": "NAME_SIZE", "reason": null,
+ "channel_id": -1002637897512, "tg_message_id": 1}
+```
+
+`409` if the catalog has never been scanned.
+
+### `POST /api/devices/{device_id}/reconcile`
+
+Body:
+
+```json
+{
+  "entries": [
+    {"relpath": "DCIM/Camera/IMG_1.jpg", "name": "IMG_1.jpg", "size": 4213556,
+     "mtime": "2026-07-01T08:00:00+00:00", "sha256": null}
+  ],
+  "snapshot_id": null,
+  "taken_at": null,
+  "final": true
+}
+```
+
+Each entry follows the [inventory manifest](#device-inventory-manifest)
+format. `snapshot_id` continues a previous, not-yet-`final` call for the
+*same* `device_id` into the same snapshot (send several calls for a library
+larger than `RECONCILE_MAX_ENTRIES`); `final: true` (the default) closes it.
+
+Response:
+
+```json
+{
+  "snapshot_id": 7,
+  "catalog": {"newest_message_date": "2026-07-20T00:00:00+00:00", "archive_rows": 4213},
+  "summary": {
+    "ARCHIVED": {"files": 4100, "bytes": 812345678},
+    "IN_FLIGHT": {"files": 3, "bytes": 9000000},
+    "AMBIGUOUS": {"files": 2, "bytes": 400000},
+    "NOT_ARCHIVED": {"files": 5, "bytes": 1200000},
+    "TOTAL": {"files": 4110, "bytes": 822945678}
+  },
+  "entries": [
+    {"relpath": "DCIM/Camera/IMG_1.jpg", "verdict": "ARCHIVED", "tier": "NAME_SIZE",
+     "reason": null, "channel_id": -1002637897512, "tg_message_id": 1}
+  ]
+}
+```
+
+`entries` echoes a verdict for every entry sent in *this* call, in order —
+including `ARCHIVED` ones, which are otherwise not stored: they are the bulk
+of any library, and the only record of one that survives is a
+`deletion_audits` row, once the client reports deleting it. Non-`ARCHIVED`
+entries are additionally persisted as `device_findings` under the snapshot,
+retrievable later from `GET /api/devices/{device_id}/snapshot`.
+
+Refusals:
+- `413` — more entries than `RECONCILE_MAX_ENTRIES` in one call. Continue in
+  several calls, passing the `snapshot_id` the first call returned.
+- `409` — the catalog has never been scanned; or `snapshot_id` belongs to a
+  different `device_id`; or that snapshot is already closed (a previous call
+  against it sent `final: true`).
+
+### `GET /api/devices/{device_id}/snapshot`
+
+The most recent snapshot for a device, and its findings (non-`ARCHIVED`
+entries only):
+
+```json
+{
+  "snapshot": {
+    "id": 7, "device_id": "pixel", "taken_at": null,
+    "completed_at": "2026-09-24T10:00:00+00:00",
+    "total_files": 4110, "total_bytes": 822945678,
+    "archived_files": 4100, "archived_bytes": 812345678,
+    "in_flight_files": 3, "ambiguous_files": 2, "not_archived_files": 5
+  },
+  "findings": [
+    {"relpath": "DCIM/Camera/IMG_9.jpg", "file_name": "IMG_9.jpg", "file_size": 300000,
+     "verdict": "NOT_ARCHIVED", "reason": "no_match"}
+  ]
+}
+```
+
+`404` if the device has no snapshot yet.
+
+### `POST /api/devices/{device_id}/deletions`
+
+Body:
+
+```json
+{
+  "deleted": [
+    {"relpath": "DCIM/Camera/IMG_1.jpg", "name": "IMG_1.jpg", "size": 4213556,
+     "tier": "NAME_SIZE", "channel_id": -1002637897512, "tg_message_id": 1,
+     "deleted_at": "2026-09-24T10:00:00Z"}
+  ]
+}
+```
+
+Records that the client already deleted these local files — one
+`deletion_audits` row per entry, permanent, with no foreign key to any
+snapshot so it outlives snapshot pruning. **The server never deletes
+anything**; this is a log of what a client did, kept so a deletion stays
+traceable back to the channel message that justified it. Response:
+`{"recorded": 1}`.
+
+### `POST /api/catalog/scan`
+
+Rescans every configured channel (`CatalogService.scan_all`), then matches
+against the worker's own DB and, if `BACKUP_STATE_DB` is set, against
+`scripts/backup_local_folder.py`'s state DB. This is what takes
+`archive_rows` above `0` and is the prerequisite for every other endpoint on
+this page. `503` without a catalog service configured.
+
+```json
+{"scanned": {"-1002637897512": {"scanned": 4213, "ingested": 12, "updated": 3}},
+ "matched": {"worker": 4100, "backup_script": 113}}
+```
+
+### `POST /api/catalog/resolve-manifests`
+
+Query: `limit` (1–500, default 50). Gives a chunked original (a file split
+because it was over 2 GB) an identity in the catalog by reading its manifest,
+so it becomes findable by name+size like any other file. `503` without a
+catalog service configured.
+
+```json
+{"resolved": 1, "failed": 0, "remaining": 0}
+```
+
+### `POST /api/vault/verify`
+
+Body: `{"channel_id", "tg_message_id", "file_size", "head_sha256", "tail_sha256"}`.
+
+Settles one `AMBIGUOUS` entry by hashing `RECONCILE_FINGERPRINT_BYTES` bytes
+from each end of the archived copy — no download of the middle, ~2×
+`RECONCILE_FINGERPRINT_BYTES` of Telegram traffic regardless of file size —
+and comparing against the client's own head/tail hashes of the same window.
+
+```json
+{"match": true, "head_sha256": "…", "tail_sha256": "…"}
+```
+
+`503` without a Telegram service configured. `404` — naming the channel and
+message — if the message is missing or has been deleted from the channel.
 
 ## State machines
 
@@ -229,6 +425,38 @@ chunks (commit marker), caption = date hashtags + `#manifest`:
   "tool": "telegram-photo-vault"
 }
 ```
+
+## Device inventory manifest
+
+The format a client (Termux script, adb script, Android app — none of which
+exist in this repo) builds before calling
+[`POST /api/devices/{device_id}/reconcile`](#post-apidevicesdevice_idreconcile). One
+JSON object per local file:
+
+```json
+{
+  "relpath": "DCIM/Camera/IMG_20260701_080000.jpg",
+  "name": "IMG_20260701_080000.jpg",
+  "size": 4213556,
+  "mtime": "2026-07-01T08:00:00+00:00",
+  "sha256": null
+}
+```
+
+- `relpath` — path relative to the device's photo root. Round-tripped back in
+  responses and findings; never parsed or matched by the server.
+- `name` — the filename alone (`relpath`'s basename). This is what is matched
+  against the catalog.
+- `size` — size in bytes, as an integer.
+- `mtime` — the file's local modification time, ISO-8601, **and it must carry
+  a UTC offset** (e.g. `+00:00` or `Z`). A naive timestamp with no offset is
+  read as UTC today — which biases towards *passing* the catalog-freshness
+  gate for a file that may actually be newer than the last scan, the opposite
+  of the fail-safe the gate exists for. Always send an offset.
+- `sha256` — optional, lowercase hex, the whole-file SHA-256. Omit it or send
+  `null` when it hasn't been computed; a present, matching hash is the
+  strongest evidence (`HASH` tier) and settles the file regardless of name or
+  size.
 
 ## vault_merge CLI
 

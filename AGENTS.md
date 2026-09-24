@@ -113,6 +113,12 @@ Pyrogram fork, same `pyrogram` namespace), Pillow (+pillow-heif), asyncssh.
   script's state DB. Unset means the channel is skipped.)
 - `CATALOG_SCAN_DELAY` (default: `2`; seconds between channels during a full
   catalog scan)
+- `RECONCILE_MAX_ENTRIES` (default: `10000`; inventory entries accepted per
+  `POST /api/devices/{device_id}/reconcile` call. More is refused with `413` and a
+  message telling the client to continue against the same `snapshot_id`.)
+- `RECONCILE_FINGERPRINT_BYTES` (default: `262144`; bytes hashed at each end
+  of a file when `POST /api/vault/verify` settles an ambiguous match. Telegram
+  streams in 1 MiB chunks, so the traffic cost is 2 MiB regardless.)
 
 ## Local Run
 1. `pip install -r requirements.txt`

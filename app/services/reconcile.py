@@ -16,6 +16,9 @@ from app.models.database import (
     AsyncSessionLocal,
     CatalogItem,
     ChannelRole,
+    DeletionAudit,
+    DeviceFinding,
+    DeviceSnapshot,
     DeviceVerdict,
     MatchTier,
     Photo,
@@ -179,8 +182,24 @@ def _parse_mtime(value: object) -> datetime | None:
         return None
 
 
+class SnapshotConflict(RuntimeError):
+    """A continuation that does not belong to this device, or is already closed."""
+
+
+_VERDICT_COLUMNS = {
+    DeviceVerdict.ARCHIVED: ("archived_files", "archived_bytes"),
+    DeviceVerdict.IN_FLIGHT: ("in_flight_files", "in_flight_bytes"),
+    DeviceVerdict.AMBIGUOUS: ("ambiguous_files", "ambiguous_bytes"),
+    DeviceVerdict.NOT_ARCHIVED: ("not_archived_files", "not_archived_bytes"),
+}
+
+
 class ReconcileService:
     """Fetches candidates for an inventory and asks `decide` about each entry."""
+
+    def __init__(self, *, max_entries: int = 10_000, fingerprint_bytes: int = 262_144) -> None:
+        self.max_entries = max_entries
+        self.fingerprint_bytes = fingerprint_bytes
 
     async def catalog_freshness(self) -> dict[str, object]:
         """Newest archive-channel message the catalog has seen, and how many rows."""
@@ -225,6 +244,145 @@ class ReconcileService:
                 )
             )
         return decisions
+
+    async def reconcile(
+        self,
+        device_id: str,
+        entries: Sequence[dict],
+        *,
+        snapshot_id: int | None = None,
+        taken_at: datetime | None = None,
+        final: bool = True,
+    ) -> dict[str, object]:
+        """Evaluate one batch, fold it into a snapshot, keep only what matters.
+
+        ARCHIVED entries are returned and not stored: they are the bulk, and the
+        only time anyone looks at one again is through the audit, once it is gone.
+        """
+        decisions = await self.evaluate(entries)
+
+        async with AsyncSessionLocal() as session:
+            if snapshot_id is None:
+                snapshot = DeviceSnapshot(device_id=device_id, taken_at=taken_at)
+                session.add(snapshot)
+                await session.flush()
+            else:
+                snapshot = await session.get(DeviceSnapshot, snapshot_id)
+                if snapshot is None or snapshot.device_id != device_id:
+                    raise SnapshotConflict(
+                        f"Snapshot {snapshot_id} does not belong to device {device_id!r}."
+                    )
+                if snapshot.completed_at is not None:
+                    raise SnapshotConflict(f"Snapshot {snapshot_id} is already closed.")
+
+            for entry, decision in zip(entries, decisions):
+                size = int(entry.get("size") or 0)
+                snapshot.total_files += 1
+                snapshot.total_bytes += size
+                files_column, bytes_column = _VERDICT_COLUMNS[decision.verdict]
+                setattr(snapshot, files_column, getattr(snapshot, files_column) + 1)
+                setattr(snapshot, bytes_column, getattr(snapshot, bytes_column) + size)
+
+                if decision.verdict is not DeviceVerdict.ARCHIVED:
+                    session.add(
+                        DeviceFinding(
+                            snapshot_id=snapshot.id,
+                            relpath=str(entry.get("relpath") or ""),
+                            file_name=str(entry.get("name") or ""),
+                            file_size=size,
+                            verdict=decision.verdict,
+                            reason=decision.reason,
+                        )
+                    )
+
+            if final:
+                snapshot.completed_at = datetime.now(timezone.utc)
+
+            await session.commit()
+            await session.refresh(snapshot)
+            summary = _summary_of(snapshot)
+            new_id = snapshot.id
+
+        return {
+            "snapshot_id": new_id,
+            "catalog": await self.catalog_freshness(),
+            "summary": summary,
+            "entries": [
+                {
+                    "relpath": entry.get("relpath"),
+                    "verdict": decision.verdict.value,
+                    "tier": decision.tier.value if decision.tier else None,
+                    "reason": decision.reason,
+                    "channel_id": decision.channel_id,
+                    "tg_message_id": decision.tg_message_id,
+                }
+                for entry, decision in zip(entries, decisions)
+            ],
+        }
+
+    async def latest_snapshot(self, device_id: str) -> dict[str, object] | None:
+        async with AsyncSessionLocal() as session:
+            snapshot = await session.scalar(
+                select(DeviceSnapshot)
+                .where(DeviceSnapshot.device_id == device_id)
+                .order_by(DeviceSnapshot.id.desc())
+                .limit(1)
+            )
+            if snapshot is None:
+                return None
+            findings = list(
+                (
+                    await session.scalars(
+                        select(DeviceFinding)
+                        .where(DeviceFinding.snapshot_id == snapshot.id)
+                        .order_by(DeviceFinding.id)
+                    )
+                ).all()
+            )
+            return {
+                "snapshot": {
+                    "id": snapshot.id,
+                    "device_id": snapshot.device_id,
+                    "taken_at": snapshot.taken_at,
+                    "completed_at": snapshot.completed_at,
+                    "total_files": snapshot.total_files,
+                    "total_bytes": snapshot.total_bytes,
+                    "archived_files": snapshot.archived_files,
+                    "archived_bytes": snapshot.archived_bytes,
+                    "in_flight_files": snapshot.in_flight_files,
+                    "ambiguous_files": snapshot.ambiguous_files,
+                    "not_archived_files": snapshot.not_archived_files,
+                },
+                "findings": [
+                    {
+                        "relpath": f.relpath,
+                        "file_name": f.file_name,
+                        "file_size": f.file_size,
+                        "verdict": f.verdict.value,
+                        "reason": f.reason,
+                    }
+                    for f in findings
+                ],
+            }
+
+    async def record_deletions(self, device_id: str, records: Sequence[dict]) -> int:
+        """Write the permanent audit. This is what makes a deletion recoverable."""
+        async with AsyncSessionLocal() as session:
+            for record in records:
+                session.add(
+                    DeletionAudit(
+                        device_id=device_id,
+                        relpath=str(record["relpath"]),
+                        file_name=str(record["name"]),
+                        file_size=int(record["size"]),
+                        tier=MatchTier(record["tier"]),
+                        channel_id=int(record["channel_id"]),
+                        tg_message_id=int(record["tg_message_id"]),
+                        deleted_at=_parse_mtime(record.get("deleted_at")),
+                    )
+                )
+            await session.commit()
+        return len(records)
 
     async def _candidates_for(self, names: set[str]) -> dict[str, tuple[Candidate, ...]]:
         """Candidates keyed by lower-cased name, so a case-only match is findable.
@@ -308,3 +466,16 @@ class ReconcileService:
             ):
                 statuses[basename] = status
         return statuses
+
+
+def _summary_of(snapshot: DeviceSnapshot) -> dict[str, dict[str, int]]:
+    return {
+        "ARCHIVED": {"files": snapshot.archived_files, "bytes": snapshot.archived_bytes},
+        "IN_FLIGHT": {"files": snapshot.in_flight_files, "bytes": snapshot.in_flight_bytes},
+        "AMBIGUOUS": {"files": snapshot.ambiguous_files, "bytes": snapshot.ambiguous_bytes},
+        "NOT_ARCHIVED": {
+            "files": snapshot.not_archived_files,
+            "bytes": snapshot.not_archived_bytes,
+        },
+        "TOTAL": {"files": snapshot.total_files, "bytes": snapshot.total_bytes},
+    }

@@ -1,0 +1,283 @@
+"""The endpoints: auth, the refusals, continuation rules and the audit.
+
+Built like tests/test_api.py: a bare FastAPI with the router mounted and
+app.state set by hand, never running the lifespan.
+"""
+import asyncio
+from datetime import datetime, timezone
+
+import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+from app.api.routes import router
+from app.models.database import (
+    AsyncSessionLocal,
+    CatalogItem,
+    ChannelRole,
+    DeletionAudit,
+)
+from app.services.reconcile import ReconcileService
+
+ARCHIVE = -1002637897512
+KEY = "test-key"
+
+
+class FakeTelegram:
+    """Duck-types only fingerprint_message, returning a fixed digest pair."""
+
+    def __init__(self, fingerprint: dict[str, str]):
+        self.fingerprint = fingerprint
+
+    async def fingerprint_message(self, channel_id, message_id, *, file_size, window):
+        return dict(self.fingerprint)
+
+
+class MissingMessageTelegram:
+    """Reproduces the real client's failure mode for a missing/deleted message:
+    stream_media blows up with a bare AttributeError, not a purpose-built error.
+    """
+
+    async def fingerprint_message(self, channel_id, message_id, *, file_size, window):
+        raise AttributeError("'NoneType' object has no attribute 'stream_media'")
+
+
+@pytest.fixture
+def app_state(client):
+    """The FastAPI state the client fixture built, for tests that add a service."""
+    return client.app.state
+
+
+@pytest.fixture
+def client(clean_db, monkeypatch):
+    monkeypatch.setenv("API_KEY", KEY)
+
+    async def seed():
+        async with AsyncSessionLocal() as session:
+            session.add(
+                CatalogItem(
+                    channel_id=ARCHIVE,
+                    tg_message_id=1,
+                    channel_role=ChannelRole.ARCHIVE,
+                    media_kind="document",
+                    file_name="a.jpg",
+                    file_size=100,
+                    message_date=datetime(2026, 7, 20, tzinfo=timezone.utc),
+                )
+            )
+            await session.commit()
+
+    asyncio.run(seed())
+
+    app = FastAPI()
+    app.include_router(router)
+    app.state.reconcile = ReconcileService(max_entries=3)
+    with TestClient(app) as test_client:
+        yield test_client
+    asyncio.run(_dispose())
+
+
+async def _dispose():
+    from app.models.database import engine
+
+    await engine.dispose()
+
+
+def _entry(name="a.jpg", size=100):
+    return {"relpath": f"DCIM/{name}", "name": name, "size": size,
+            "mtime": "2026-07-01T00:00:00Z", "sha256": None}
+
+
+def _post(client, path, body):
+    return client.post(path, json=body, headers={"X-Api-Key": KEY})
+
+
+def test_reconcile_requires_the_api_key(client):
+    response = client.post("/api/devices/pixel/reconcile", json={"entries": []})
+    assert response.status_code == 401
+
+
+def test_reconcile_returns_a_verdict_per_entry_and_a_summary(client):
+    response = _post(client, "/api/devices/pixel/reconcile",
+                     {"entries": [_entry(), _entry("missing.jpg", 5)]})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["summary"]["ARCHIVED"]["files"] == 1
+    assert body["summary"]["NOT_ARCHIVED"]["files"] == 1
+    assert [e["verdict"] for e in body["entries"]] == ["ARCHIVED", "NOT_ARCHIVED"]
+    assert body["catalog"]["archive_rows"] == 1
+
+
+def test_only_non_archived_entries_are_stored_as_findings(client):
+    body = _post(client, "/api/devices/pixel/reconcile",
+                 {"entries": [_entry(), _entry("missing.jpg", 5)]}).json()
+    snapshot = client.get("/api/devices/pixel/snapshot", headers={"X-Api-Key": KEY}).json()
+    assert snapshot["snapshot"]["archived_files"] == 1
+    assert [f["file_name"] for f in snapshot["findings"]] == ["missing.jpg"]
+    assert body["snapshot_id"] == snapshot["snapshot"]["id"]
+
+
+def test_too_many_entries_is_refused_with_413(client):
+    response = _post(client, "/api/devices/pixel/reconcile",
+                     {"entries": [_entry(f"f{i}.jpg") for i in range(4)]})
+    assert response.status_code == 413
+
+
+def test_a_continuation_accumulates_into_one_snapshot(client):
+    first = _post(client, "/api/devices/pixel/reconcile",
+                  {"entries": [_entry()], "final": False}).json()
+    second = _post(client, "/api/devices/pixel/reconcile",
+                   {"entries": [_entry("missing.jpg", 5)],
+                    "snapshot_id": first["snapshot_id"], "final": True}).json()
+
+    assert second["snapshot_id"] == first["snapshot_id"]
+    assert second["summary"]["ARCHIVED"]["files"] == 1
+    assert second["summary"]["NOT_ARCHIVED"]["files"] == 1
+
+
+def test_taken_at_is_recorded_on_the_snapshot(client):
+    """The request accepts the client's own clock; it must actually be stored,
+    not silently dropped on the way to ReconcileService.reconcile."""
+    _post(client, "/api/devices/pixel/reconcile",
+          {"entries": [_entry()], "taken_at": "2026-09-24T10:00:00Z"})
+    snapshot = client.get("/api/devices/pixel/snapshot", headers={"X-Api-Key": KEY}).json()
+    assert snapshot["snapshot"]["taken_at"].startswith("2026-09-24T10:00:00")
+
+
+def test_a_snapshot_belonging_to_another_device_is_refused(client):
+    first = _post(client, "/api/devices/pixel/reconcile",
+                  {"entries": [_entry()], "final": False}).json()
+    response = _post(client, "/api/devices/samsung/reconcile",
+                     {"entries": [_entry()], "snapshot_id": first["snapshot_id"]})
+    assert response.status_code == 409
+
+
+def test_a_finished_snapshot_cannot_be_continued(client):
+    first = _post(client, "/api/devices/pixel/reconcile",
+                  {"entries": [_entry()], "final": True}).json()
+    response = _post(client, "/api/devices/pixel/reconcile",
+                     {"entries": [_entry()], "snapshot_id": first["snapshot_id"]})
+    assert response.status_code == 409
+
+
+def test_an_unscanned_catalog_is_a_409_not_a_confident_answer(clean_db, monkeypatch):
+    monkeypatch.setenv("API_KEY", KEY)
+    app = FastAPI()
+    app.include_router(router)
+    app.state.reconcile = ReconcileService()
+    with TestClient(app) as test_client:
+        response = test_client.post("/api/devices/pixel/reconcile",
+                                    json={"entries": [_entry()]},
+                                    headers={"X-Api-Key": KEY})
+    assert response.status_code == 409
+    assert "scan" in response.json()["detail"].lower()
+    asyncio.run(_dispose())
+
+
+def test_recorded_deletions_are_audited(client):
+    response = _post(client, "/api/devices/pixel/deletions", {
+        "deleted": [{
+            "relpath": "DCIM/a.jpg", "name": "a.jpg", "size": 100,
+            "tier": "NAME_SIZE", "channel_id": ARCHIVE, "tg_message_id": 1,
+            "deleted_at": "2026-09-24T10:00:00Z",
+        }]
+    })
+    assert response.status_code == 200
+    assert response.json()["recorded"] == 1
+
+    async def read():
+        async with AsyncSessionLocal() as session:
+            from sqlalchemy import select
+
+            return list((await session.scalars(select(DeletionAudit))).all())
+
+    rows = asyncio.run(read())
+    assert len(rows) == 1
+    assert rows[0].tg_message_id == 1
+    assert rows[0].device_id == "pixel"
+
+
+def test_verify_compares_the_clients_fingerprint_with_the_archived_copy(client, app_state):
+    app_state.telegram = FakeTelegram({"head_sha256": "h" * 64, "tail_sha256": "t" * 64})
+
+    agreeing = _post(client, "/api/vault/verify", {
+        "channel_id": ARCHIVE, "tg_message_id": 1, "file_size": 100,
+        "head_sha256": "h" * 64, "tail_sha256": "t" * 64,
+    })
+    assert agreeing.json()["match"] is True
+
+    disagreeing = _post(client, "/api/vault/verify", {
+        "channel_id": ARCHIVE, "tg_message_id": 1, "file_size": 100,
+        "head_sha256": "h" * 64, "tail_sha256": "x" * 64,
+    })
+    assert disagreeing.json()["match"] is False
+
+
+def test_verify_without_a_telegram_service_is_503(client):
+    response = _post(client, "/api/vault/verify", {
+        "channel_id": ARCHIVE, "tg_message_id": 1, "file_size": 100,
+        "head_sha256": "h" * 64, "tail_sha256": "t" * 64,
+    })
+    assert response.status_code == 503
+
+
+def test_verify_of_a_missing_message_is_404_not_500(client, app_state):
+    """The known issue: fingerprint_message raises a bare AttributeError when
+    the message is gone. The route must turn that into a 404, not a 500."""
+    app_state.telegram = MissingMessageTelegram()
+
+    response = _post(client, "/api/vault/verify", {
+        "channel_id": ARCHIVE, "tg_message_id": 999, "file_size": 100,
+        "head_sha256": "h" * 64, "tail_sha256": "t" * 64,
+    })
+    assert response.status_code == 404
+    detail = response.json()["detail"]
+    assert str(ARCHIVE) in detail
+    assert "999" in detail
+
+
+def test_scan_and_resolve_routes_reach_the_catalog_service(client, app_state):
+    """Without these two, nothing could ever populate the catalog."""
+
+    class FakeCatalog:
+        def __init__(self):
+            self.calls = []
+
+        async def scan_all(self):
+            self.calls.append("scan_all")
+            return {"-100": {"scanned": 3, "ingested": 3, "updated": 0}}
+
+        async def match_all(self, state_db_path=None):
+            self.calls.append("match_all")
+            return {"worker": 0, "backup_script": 0}
+
+        async def resolve_manifests(self, limit=50):
+            self.calls.append(f"resolve_manifests:{limit}")
+            return {"resolved": 1, "failed": 0, "remaining": 0}
+
+    app_state.catalog = FakeCatalog()
+
+    scanned = _post(client, "/api/catalog/scan", {})
+    assert scanned.status_code == 200
+    assert scanned.json()["scanned"]["-100"]["ingested"] == 3
+
+    resolved = client.post("/api/catalog/resolve-manifests", params={"limit": 10},
+                           headers={"X-Api-Key": KEY})
+    assert resolved.json()["resolved"] == 1
+    assert app_state.catalog.calls == ["scan_all", "match_all", "resolve_manifests:10"]
+
+
+def test_the_catalog_routes_are_503_without_the_service(client):
+    assert _post(client, "/api/catalog/scan", {}).status_code == 503
+
+
+def test_catalog_freshness_reports_what_the_client_needs(client):
+    body = client.get("/api/catalog/freshness", headers={"X-Api-Key": KEY}).json()
+    assert body["archive_rows"] == 1
+    assert body["newest_message_date"].startswith("2026-07-20")
+
+
+def test_lookup_answers_a_single_file(client):
+    body = client.get("/api/vault/lookup", params={"name": "a.jpg", "size": 100},
+                      headers={"X-Api-Key": KEY}).json()
+    assert body["verdict"] == "ARCHIVED"

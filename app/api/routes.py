@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import secrets
 import shutil
+from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
@@ -11,6 +12,12 @@ from sqlalchemy import func, select
 
 from app.models.database import AsyncSessionLocal, Photo, PhotoStatus, RecoveryItem, RecoveryStatus
 from app.services.recovery import RecoveryBusyError
+from app.services.reconcile import (
+    CatalogNeverScanned,
+    ReconcileService,
+    SnapshotConflict,
+    _parse_mtime,
+)
 
 ERROR_LOG_PREVIEW_CHARS = 4000
 
@@ -314,3 +321,202 @@ async def get_system() -> dict[str, int | float | str]:
         "free_bytes": usage.free,
         "used_percent": round(used_percent, 2),
     }
+
+
+class ReconcileEntry(BaseModel):
+    relpath: str
+    name: str
+    size: int
+    mtime: str | None = None
+    sha256: str | None = None
+
+
+class ReconcileRequest(BaseModel):
+    entries: list[ReconcileEntry]
+    snapshot_id: int | None = None
+    taken_at: str | None = None
+    # False while a client is sending a large library in several calls.
+    final: bool = True
+
+
+class DeletionRecord(BaseModel):
+    relpath: str
+    name: str
+    size: int
+    tier: str
+    channel_id: int
+    tg_message_id: int
+    deleted_at: str | None = None
+
+
+class DeletionsRequest(BaseModel):
+    deleted: list[DeletionRecord]
+
+
+class VerifyRequest(BaseModel):
+    channel_id: int
+    tg_message_id: int
+    file_size: int
+    head_sha256: str
+    tail_sha256: str
+
+
+def _require_reconcile(request: Request) -> ReconcileService:
+    service = getattr(request.app.state, "reconcile", None)
+    if service is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Reconciliation service is not available.",
+        )
+    return service
+
+
+@router.get("/catalog/freshness")
+async def catalog_freshness(request: Request) -> dict[str, object]:
+    return await _require_reconcile(request).catalog_freshness()
+
+
+@router.get("/vault/lookup")
+async def vault_lookup(
+    request: Request,
+    name: str = Query(..., min_length=1),
+    size: int = Query(...),
+) -> dict[str, object]:
+    service = _require_reconcile(request)
+    entry = {
+        "relpath": name,
+        "name": name,
+        "size": size,
+        # This endpoint takes no local mtime, unlike a device's real inventory
+        # entries. decide() fails closed on an unknown mtime (treats it as
+        # newer than the catalog, to protect a real reconcile call from a
+        # stale NAME_SIZE match) — with mtime always None that gate would fire
+        # on every call and a plain name+size match could never come back
+        # ARCHIVED. Reporting the epoch instead means "not newer than the
+        # catalog" and lets a genuine match through; this lookup is
+        # informational only and never authorises a deletion by itself.
+        "mtime": datetime(1970, 1, 1, tzinfo=timezone.utc).isoformat(),
+        "sha256": None,
+    }
+    try:
+        [decision] = await service.evaluate([entry])
+    except CatalogNeverScanned as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+    return {
+        "verdict": decision.verdict.value,
+        "tier": decision.tier.value if decision.tier else None,
+        "reason": decision.reason,
+        "channel_id": decision.channel_id,
+        "tg_message_id": decision.tg_message_id,
+    }
+
+
+@router.post("/devices/{device_id}/reconcile")
+async def device_reconcile(
+    device_id: str, request: Request, payload: ReconcileRequest
+) -> dict[str, object]:
+    service = _require_reconcile(request)
+    if len(payload.entries) > service.max_entries:
+        raise HTTPException(
+            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+            detail=(
+                f"{len(payload.entries)} entries exceeds the limit of "
+                f"{service.max_entries}. Send the inventory in several calls, "
+                f"passing the snapshot_id returned by the first."
+            ),
+        )
+    try:
+        return await service.reconcile(
+            device_id,
+            [entry.model_dump() for entry in payload.entries],
+            snapshot_id=payload.snapshot_id,
+            taken_at=_parse_mtime(payload.taken_at),
+            final=payload.final,
+        )
+    except CatalogNeverScanned as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+    except SnapshotConflict as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+
+
+@router.get("/devices/{device_id}/snapshot")
+async def device_snapshot(device_id: str, request: Request) -> dict[str, object]:
+    snapshot = await _require_reconcile(request).latest_snapshot(device_id)
+    if snapshot is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No snapshot recorded for device {device_id!r}.",
+        )
+    return snapshot
+
+
+@router.post("/devices/{device_id}/deletions")
+async def device_deletions(
+    device_id: str, request: Request, payload: DeletionsRequest
+) -> dict[str, int]:
+    service = _require_reconcile(request)
+    recorded = await service.record_deletions(
+        device_id, [record.model_dump() for record in payload.deleted]
+    )
+    return {"recorded": recorded}
+
+
+def _require_catalog(request: Request):
+    catalog = getattr(request.app.state, "catalog", None)
+    if catalog is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Catalog service is not available.",
+        )
+    return catalog
+
+
+@router.post("/catalog/scan")
+async def catalog_scan(request: Request) -> dict[str, object]:
+    catalog = _require_catalog(request)
+    results = await catalog.scan_all()
+    matched = await catalog.match_all(os.getenv("BACKUP_STATE_DB") or None)
+    return {"scanned": results, "matched": matched}
+
+
+@router.post("/catalog/resolve-manifests")
+async def catalog_resolve_manifests(
+    request: Request, limit: int = Query(default=50, ge=1, le=500)
+) -> dict[str, int]:
+    """Give chunked originals their identity, so files above 2 GB become findable."""
+    return await _require_catalog(request).resolve_manifests(limit=limit)
+
+
+@router.post("/vault/verify")
+async def vault_verify(request: Request, payload: VerifyRequest) -> dict[str, object]:
+    """Settle one AMBIGUOUS entry against the archived copy, for ~2 MiB of traffic."""
+    service = _require_reconcile(request)
+    telegram = getattr(request.app.state, "telegram", None)
+    if telegram is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Telegram service is not available.",
+        )
+    try:
+        archived = await telegram.fingerprint_message(
+            payload.channel_id,
+            payload.tg_message_id,
+            file_size=payload.file_size,
+            window=service.fingerprint_bytes,
+        )
+    except AttributeError:
+        # The client's real failure mode for a missing/deleted message: get_messages
+        # returns something stream_media cannot read, and it blows up with a bare
+        # AttributeError rather than a purpose-built error. Turn it into a 404.
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=(
+                f"Message {payload.tg_message_id} in channel {payload.channel_id} "
+                "was not found or has been deleted."
+            ),
+        )
+    matched = (
+        archived["head_sha256"] == payload.head_sha256
+        and archived["tail_sha256"] == payload.tail_sha256
+    )
+    return {"match": matched, **archived}

@@ -19,6 +19,7 @@ from app.api.routes import router as api_router
 from app.models.database import ChannelRole, init_db
 from app.services.catalog import CatalogService, ChannelSpec, channel_spec_or_none
 from app.services.mega import MegaService
+from app.services.reconcile import ReconcileService
 from app.services.recovery import MEDIA_KINDS, RecoveryService
 from app.services.sftp import SFTPService
 from app.services.telegram import TelegramService
@@ -141,6 +142,14 @@ async def lifespan(app: FastAPI):
                 float(os.getenv("RECOVERY_BATCH_MAX_DOWNLOAD_GB", "5")) * 1024**3
             ),
         )
+
+        reconcile_service = ReconcileService(
+            max_entries=int(os.getenv("RECONCILE_MAX_ENTRIES", "10000")),
+            fingerprint_bytes=int(os.getenv("RECONCILE_FINGERPRINT_BYTES", "262144")),
+        )
+        app.state.reconcile = reconcile_service
+        # The verify endpoint needs the service, not just the raw client already on state.
+        app.state.telegram = telegram_service
 
         iphone_channel_raw = _optional_env("IPHONE_CHANNEL_ID")
         catalog_channels: list[ChannelSpec] = []
