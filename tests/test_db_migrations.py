@@ -9,6 +9,9 @@ from app.models.database import (
     _COLUMN_MIGRATIONS,
     Base,
     CatalogItem,
+    DeletionAudit,
+    DeviceFinding,
+    DeviceSnapshot,
     Photo,
     RecoveryItem,
     UploadChunk,
@@ -160,7 +163,10 @@ async def test_device_tables_are_created_on_a_legacy_database():
         await init_db()
 
         async with engine.begin() as conn:
-            for table in ("device_snapshots", "device_findings", "deletion_audits"):
+            # The names come from the models, so renaming a __tablename__ without
+            # updating this test fails here instead of passing quietly.
+            for model in (DeviceSnapshot, DeviceFinding, DeletionAudit):
+                table = model.__tablename__
                 result = await conn.exec_driver_sql(
                     "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,)
                 )
