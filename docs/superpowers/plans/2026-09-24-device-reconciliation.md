@@ -104,6 +104,7 @@ from sqlalchemy import select
 
 from app.models.database import AsyncSessionLocal, CatalogItem, ChannelRole
 from app.services.catalog import CatalogService, ChannelSpec
+from app.services.chunking import MANIFEST_KIND
 
 CHANNEL = -1002637897512
 
