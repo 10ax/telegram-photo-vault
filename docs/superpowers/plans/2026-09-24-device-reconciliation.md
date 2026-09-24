@@ -109,10 +109,11 @@ CHANNEL = -1002637897512
 
 
 def _manifest_bytes(*, name="movie.mp4", total_size=5_000_000_000, sha="a" * 64, count=3):
+    # kind comes from chunking.MANIFEST_KIND so the fixture cannot drift from the contract
     return json.dumps(
         {
             "manifest_version": 1,
-            "kind": "chunked-file-manifest",
+            "kind": MANIFEST_KIND,
             "original_filename": name,
             "total_size": total_size,
             "sha256": sha,
@@ -293,7 +294,7 @@ In `app/services/catalog.py`, add the import and the method on `CatalogService`:
 ```python
 import json
 
-MANIFEST_KIND = "chunked-file-manifest"
+from app.services.chunking import MANIFEST_KIND
 
 
 def parse_manifest(payload: bytes) -> tuple[str, int, str]:
