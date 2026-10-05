@@ -76,7 +76,8 @@ Pyrogram fork, same `pyrogram` namespace), Pillow (+pillow-heif), asyncssh.
 - `MEGA_TARGET_FOLDER` (default: `/Camera`)
 - `TELEGRAM_SESSION_NAME` (default: `telegram_photo_vault`)
 - `TELEGRAM_SESSION_STRING`
-- `TELEGRAM_UPLOAD_DELAY` (default: `5`)
+- `TELEGRAM_UPLOAD_DELAY` (default: `10`; seconds slept after every upload —
+  see `docs/telegram-rate-limits.md`)
 - `TELEGRAM_SLEEP_THRESHOLD` (default: `60`; auto-sleep on FloodWait below this)
 - `BROWSE_CHANNEL_ID` (optional; a second channel that both people join. When set,
   the worker mirrors a native, date-captioned photo/video there for gallery-style
@@ -98,7 +99,7 @@ Pyrogram fork, same `pyrogram` namespace), Pillow (+pillow-heif), asyncssh.
   raise both only on a Premium account — standard accounts cap at 2 GB)
 - `RECOVERY_DOWNLOAD_ROOT` (default: `/data/recovery`; scratch for EXIF-only
   downloads, cleaned per item)
-- `RECOVERY_DELAY` (default: `5`; seconds between items in a batch),
+- `RECOVERY_DELAY` (default: `8`; seconds between items in a batch),
   `RECOVERY_MAX_RETRIES` (default: `3`)
 - `RECOVERY_KINDS` (default: `photo,video,document,animation`)
 - `RECOVERY_BATCH_SIZE` (default: `300`; items processed per run)

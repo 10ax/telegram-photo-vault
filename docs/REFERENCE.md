@@ -34,7 +34,7 @@ Technical reference for Telegram Photo Vault. For setup and workflows, see the
 | `MEGA_TARGET_FOLDER` | `/Camera` | Remote folder watched for new files |
 | `TELEGRAM_SESSION_NAME` | `telegram_photo_vault` | Session file name |
 | `TELEGRAM_SESSION_STRING` | – | Portable session; avoids interactive login |
-| `TELEGRAM_UPLOAD_DELAY` | `5` | Seconds slept after every upload |
+| `TELEGRAM_UPLOAD_DELAY` | `10` | Seconds slept after every upload. See `docs/telegram-rate-limits.md` |
 | `TELEGRAM_SLEEP_THRESHOLD` | `60` | FloodWaits shorter than this are slept automatically |
 | `WORKER_MODE` | `interval` | `interval` (scheduled) or `manual` (on-demand only) |
 | `WORKER_RUN_INTERVAL` | `900` | Seconds between scheduled runs |
@@ -46,7 +46,7 @@ Technical reference for Telegram Photo Vault. For setup and workflows, see the
 | `CHUNK_THRESHOLD` | `1950000000` | Files above this many bytes are chunked |
 | `CHUNK_SIZE` | `1900000000` | Chunk size in bytes. Raise both only on Premium (4 GB cap) |
 | `RECOVERY_DOWNLOAD_ROOT` | `/data/recovery` | Recovery temp downloads |
-| `RECOVERY_DELAY` | `5` | Seconds slept between recovery items |
+| `RECOVERY_DELAY` | `8` | Seconds slept between recovery items |
 | `RECOVERY_MAX_RETRIES` | `3` | Failures before a recovery item is `FAILED` |
 | `RECOVERY_KINDS` | `photo,video,document,animation` | Message media kinds ingested by the scan |
 | `RECOVERY_DELETE_OLD` | `true` | Delete originals after the tidy replacement is confirmed |

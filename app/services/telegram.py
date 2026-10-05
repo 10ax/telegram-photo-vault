@@ -138,7 +138,7 @@ class TelegramService:
         client: Client,
         channel_id: int | str,
         *,
-        upload_delay_seconds: float = 5.0,
+        upload_delay_seconds: float = 10.0,
         browse_channel_id: int | str | None = None,
     ) -> None:
         self.client = client

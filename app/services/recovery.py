@@ -107,7 +107,7 @@ class RecoveryService:
         telegram_service: TelegramService,
         *,
         download_root: str | Path = "/data/recovery",
-        delay_seconds: float = 5.0,
+        delay_seconds: float = 8.0,
         max_retries: int = 3,
         kinds: tuple[str, ...] = MEDIA_KINDS,
         delete_old: bool = True,

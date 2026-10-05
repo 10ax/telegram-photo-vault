@@ -88,7 +88,7 @@ async def lifespan(app: FastAPI):
         telegram_service = TelegramService(
             telegram_client,
             telegram_channel_id,
-            upload_delay_seconds=float(os.getenv("TELEGRAM_UPLOAD_DELAY", "5")),
+            upload_delay_seconds=float(os.getenv("TELEGRAM_UPLOAD_DELAY", "10")),
             browse_channel_id=browse_channel_id,
         )
 
@@ -132,7 +132,7 @@ async def lifespan(app: FastAPI):
         recovery = RecoveryService(
             telegram_service,
             download_root=os.getenv("RECOVERY_DOWNLOAD_ROOT", "/data/recovery"),
-            delay_seconds=float(os.getenv("RECOVERY_DELAY", "5")),
+            delay_seconds=float(os.getenv("RECOVERY_DELAY", "8")),
             max_retries=int(os.getenv("RECOVERY_MAX_RETRIES", "3")),
             kinds=recovery_kinds,
             delete_old=_parse_bool(os.getenv("RECOVERY_DELETE_OLD"), default=True),
