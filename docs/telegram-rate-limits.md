@@ -77,8 +77,10 @@ subsystems stack toward the same per-account limit.
   files by **≥10 s**; 5 s produced the entire 18k premium-wait count.
 - On any flood, sleep `value + jitter`, and prefer pausing *all* subsystems,
   because the limit is per account rather than per method.
-- History scans (`messages.GetHistory`) are cheap and were not observed to
-  flood; the per-channel `CATALOG_SCAN_DELAY` is defensive, not load-bearing.
+- History scans (`messages.GetHistory`) are cheap — the full 18k-message archive
+  walked in minutes — but not flood-free: a live scan on 2026-10-05 hit 3–9 s
+  `GetHistory` waits, auto-slept by the client below the 60 s threshold. Keep
+  `CATALOG_SCAN_DELAY` at 2.
 
 Current configuration after the 2026-10-05 change:
 
@@ -125,4 +127,10 @@ for those, and that is what `TELEGRAM_UPLOAD_DELAY=10` addresses; and
 **sustained full-file download**, which only reveals its throttle over minutes,
 so the backfill should start `--limit`ed and watched exactly as the catalog spec
 says.
+
+The probe exercises `upload.GetFile`. A full catalog scan of the same day
+exercised `messages.GetHistory` on 18,419 archive messages and did see small
+waits (9 s, 7 s, 4 s, 3 s), all auto-slept by the client. So: metadata reads
+(`GetFile` partial) are effectively free; history pagination is cheap but not
+free.
 <!-- probe:results:end -->
