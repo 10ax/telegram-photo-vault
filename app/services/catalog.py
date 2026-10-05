@@ -15,10 +15,11 @@ import re
 import sqlite3
 import traceback
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Sequence
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 
 from app.models.database import (
     AsyncSessionLocal,
@@ -268,6 +269,21 @@ class CatalogService:
                     ingested,
                     updated,
                 )
+
+        # The walk reached the end, so every row in this channel is now known to
+        # be current as of this instant. Recorded once per completed channel —
+        # not per row — because the frontier is "how recently was this channel
+        # fully scanned", and a partial walk must not advance it. Unchanged rows
+        # are included: on a dormant channel nothing changes between scans, and
+        # those are exactly the rows whose freshness has to advance.
+        now = datetime.now(timezone.utc)
+        async with AsyncSessionLocal() as session:
+            await session.execute(
+                update(CatalogItem)
+                .where(CatalogItem.channel_id == spec.channel_id)
+                .values(scanned_at=now)
+            )
+            await session.commit()
 
         logger.info(
             "Catalog scan %s finished: %s messages, %s new, %s refreshed.",

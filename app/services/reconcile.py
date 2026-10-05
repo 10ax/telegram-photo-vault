@@ -224,49 +224,59 @@ class ReconcileService:
         self.archive_channel_ids = tuple(archive_channel_ids or ())
 
     async def catalog_freshness(self) -> dict[str, object]:
-        """How far the catalog has been scanned, per archive channel and overall.
+        """How current the catalog is, per archive channel and overall.
 
-        `newest_message_date` is the **oldest** of the per-channel frontiers,
-        not the newest overall. With more than one archive channel a freshly
-        scanned one would otherwise drag the single maximum forward and let
-        every stale-channel `NAME_SIZE` match sail through the freshness gate
-        that exists to demote it. An archive channel with no catalogued rows
-        has no frontier at all, so the whole value is `None` and every
-        metadata match fails closed until it is scanned.
+        `frontier` is the **oldest** of the per-channel last-scanned times, not
+        the newest message date anywhere. It gates the `NAME_SIZE` inference:
+        an entry whose `mtime` is newer than the frontier cannot be trusted to
+        have been seen by the scan that vouches for its channel. Two things
+        follow from basing it on scan time rather than message date:
+
+        - A dormant channel does not pin it. The iPhone migration's newest
+          message never advances, but a scan of it today is still current; a
+          message-date frontier would demote every newer local file forever.
+        - A channel that has not been scanned since this column existed has no
+          frontier (`NULL`), so the whole value is `None` and every metadata
+          match fails closed until it is scanned. `channels` says which one.
+
+        `newest_message_date` is kept per channel for information — it is how
+        far the channel's own timeline reaches, which is not freshness.
         """
         async with AsyncSessionLocal() as session:
             result = await session.execute(
                 select(
                     CatalogItem.channel_id,
                     func.max(CatalogItem.message_date),
+                    func.max(CatalogItem.scanned_at),
                     func.count(CatalogItem.id),
                 )
                 .where(CatalogItem.channel_role == ChannelRole.ARCHIVE)
                 .group_by(CatalogItem.channel_id)
             )
-            scanned = {
-                int(channel_id): (newest, int(rows or 0))
-                for channel_id, newest, rows in result.all()
+            catalogued = {
+                int(channel_id): (newest, last_scanned, int(rows or 0))
+                for channel_id, newest, last_scanned, rows in result.all()
             }
 
         # Configured channels that hold no rows yet still belong in the answer.
-        channel_ids = set(scanned) | set(self.archive_channel_ids)
+        channel_ids = set(catalogued) | set(self.archive_channel_ids)
         per_channel = [
             {
                 "channel_id": channel_id,
-                "newest_message_date": scanned.get(channel_id, (None, 0))[0],
-                "rows": scanned.get(channel_id, (None, 0))[1],
+                "last_scanned_at": catalogued.get(channel_id, (None, None, 0))[1],
+                "newest_message_date": catalogued.get(channel_id, (None, None, 0))[0],
+                "rows": catalogued.get(channel_id, (None, None, 0))[2],
             }
             for channel_id in sorted(channel_ids)
         ]
 
-        frontiers = [entry["newest_message_date"] for entry in per_channel]
+        frontiers = [entry["last_scanned_at"] for entry in per_channel]
         oldest_frontier = (
             min(frontiers) if frontiers and all(f is not None for f in frontiers) else None
         )
 
         return {
-            "newest_message_date": oldest_frontier,
+            "frontier": oldest_frontier,
             "archive_rows": sum(entry["rows"] for entry in per_channel),
             "fingerprint_window_bytes": self.fingerprint_bytes,
             "channels": per_channel,
@@ -281,7 +291,7 @@ class ReconcileService:
                 "No archive channel has been scanned. Run POST /api/catalog/scan first."
             )
 
-        catalog_newest = freshness["newest_message_date"]
+        catalog_newest = freshness["frontier"]
         names = {str(entry.get("name") or "") for entry in entries}
         names.discard("")
         candidates = await self._candidates_for(names)

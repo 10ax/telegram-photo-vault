@@ -1,6 +1,6 @@
 """Catalog schema and channel scan."""
 import asyncio
-from datetime import datetime
+from datetime import datetime, timezone
 
 import pytest
 from sqlalchemy import select
@@ -195,6 +195,45 @@ async def test_rescanning_preserves_enrichment_and_export_state(clean_db):
     assert item.taken_at == datetime(2023, 3, 31, 15, 51, 8)
     assert item.gps_lat == 44.49
     assert item.exported_path == "2023/2023-03-31/a.jpg"
+
+
+async def test_a_completed_scan_records_when_the_channel_was_scanned(clean_db):
+    """Freshness follows the walk, not the messages: a dormant channel's newest
+    message never changes, so the message date says nothing about how current
+    the catalog is."""
+    spec = ChannelSpec(-100, ChannelRole.ARCHIVE)
+    service = CatalogService(FakeClient({-100: [_doc(1, "a.jpg")]}), [spec])
+
+    before = datetime.now(timezone.utc)
+    await service.scan_channel(spec)
+
+    async with AsyncSessionLocal() as session:
+        item = await session.scalar(select(CatalogItem))
+    assert item.scanned_at is not None
+    assert item.scanned_at.replace(tzinfo=timezone.utc) >= before
+
+
+async def test_a_rescan_advances_the_recorded_scan_time_even_when_nothing_changed(clean_db):
+    """A re-scan of an unchanged channel still refreshes its freshness. A
+    message-date frontier would stay pinned to the migration date forever and
+    quietly stop promoting any metadata match."""
+    spec = ChannelSpec(-100, ChannelRole.ARCHIVE)
+    service = CatalogService(FakeClient({-100: [_doc(1, "a.jpg")]}), [spec])
+    await service.scan_channel(spec)
+
+    async with AsyncSessionLocal() as session:
+        item = await session.scalar(select(CatalogItem))
+        item.scanned_at = datetime(2020, 1, 1, tzinfo=timezone.utc)
+        await session.commit()
+
+    result = await service.scan_channel(spec)
+
+    assert result == {"scanned": 1, "ingested": 0, "updated": 0}
+    async with AsyncSessionLocal() as session:
+        item = await session.scalar(select(CatalogItem))
+    assert item.scanned_at.replace(tzinfo=timezone.utc) > datetime(
+        2020, 1, 1, tzinfo=timezone.utc
+    )
 
 
 async def test_a_changed_file_size_updates_the_row_without_clearing_enrichment(clean_db):

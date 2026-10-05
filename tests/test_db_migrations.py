@@ -175,6 +175,24 @@ async def test_device_tables_are_created_on_a_legacy_database():
         await engine.dispose()
 
 
+async def test_catalog_items_gains_when_it_was_last_scanned():
+    """Freshness frontiers on scan time, so a catalog built before that column
+    existed is upgraded in place (and fails closed until it is rescanned)."""
+    try:
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.drop_all)
+            await conn.exec_driver_sql(LEGACY_CATALOG_ITEMS)
+
+        await init_db()
+
+        async with engine.begin() as conn:
+            info = await conn.exec_driver_sql("PRAGMA table_info(catalog_items)")
+            columns = {row[1] for row in info.fetchall()}
+            assert "scanned_at" in columns
+    finally:
+        await engine.dispose()
+
+
 async def test_catalog_items_gains_the_chunked_columns_in_place():
     """A catalog_items written before this feature is upgraded, not rebuilt."""
     try:

@@ -73,6 +73,7 @@ def client(clean_db, monkeypatch):
                     file_name="a.jpg",
                     file_size=100,
                     message_date=datetime(2026, 7, 20, tzinfo=timezone.utc),
+                    scanned_at=datetime(2026, 9, 25, tzinfo=timezone.utc),
                 )
             )
             await session.commit()
@@ -359,7 +360,8 @@ def test_the_catalog_routes_are_503_without_the_service(client):
 def test_catalog_freshness_reports_what_the_client_needs(client):
     body = client.get("/api/catalog/freshness", headers={"X-Api-Key": KEY}).json()
     assert body["archive_rows"] == 1
-    assert body["newest_message_date"].startswith("2026-07-20")
+    assert body["frontier"].startswith("2026-09-25")
+    assert body["channels"][0]["newest_message_date"].startswith("2026-07-20")
 
 
 def test_lookup_answers_a_single_file(client):

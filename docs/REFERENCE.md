@@ -161,7 +161,7 @@ deleted — it does not delete.
 |---|---|
 | `HASH` | The entry's `sha256` equals a catalog row's whole-file hash. |
 | `FINGERPRINT` | Settled by `POST /api/vault/verify`: the head+tail hashes of the archived copy match the entry's own **and** the archived copy's own size equals the entry's. Both halves are required — two files can share their first and last window and differ in the middle, and a size mismatch is the commonest reason an entry was `AMBIGUOUS` to begin with. |
-| `NAME_SIZE` | Filename and size match a catalog row, and the entry's `mtime` is not newer than the catalog's newest scanned message — otherwise the match is treated as possibly stale and the verdict falls back to `IN_FLIGHT` instead. |
+| `NAME_SIZE` | Filename and size match a catalog row, and the entry's `mtime` is not newer than the catalog's `frontier` (how recently the archive channels were last scanned) — otherwise the match is treated as possibly stale and the verdict falls back to `IN_FLIGHT` instead. |
 
 ### `GET /api/catalog/freshness`
 
@@ -169,12 +169,12 @@ How old the catalog is, so a client can judge whether to trust a
 `NOT_ARCHIVED` verdict or ask for a rescan first.
 
 ```json
-{"newest_message_date": "2026-07-01T00:00:00+00:00",
+{"frontier": "2026-09-20T18:30:00+00:00",
  "archive_rows": 4213,
  "fingerprint_window_bytes": 262144,
  "channels": [
-   {"channel_id": -1002637897512, "newest_message_date": "2026-07-01T00:00:00+00:00", "rows": 4100},
-   {"channel_id": -1002900000001, "newest_message_date": "2026-07-20T00:00:00+00:00", "rows": 113}
+   {"channel_id": -1002637897512, "last_scanned_at": "2026-09-25T09:00:00+00:00", "newest_message_date": "2026-07-01T00:00:00+00:00", "rows": 4100},
+   {"channel_id": -1002900000001, "last_scanned_at": "2026-09-20T18:30:00+00:00", "newest_message_date": "2026-08-18T00:00:00+00:00", "rows": 113}
  ]}
 ```
 
@@ -183,14 +183,20 @@ endpoints that call `evaluate` — `GET /api/vault/lookup` and `POST
 /api/devices/{device_id}/reconcile` — depend on a scanned catalog and answer
 `409` until then; the rest of the endpoints on this page don't.
 
-`newest_message_date` is the **oldest** of the per-channel frontiers, not the
-newest date anywhere. With more than one archive channel (`TELEGRAM_CHANNEL_ID`
-and `IPHONE_CHANNEL_ID` are both `archive`) a freshly scanned channel would
-otherwise drag the single number forward and let every stale channel's
-`NAME_SIZE` match pass the gate that exists to demote it. An archive channel
-with no catalogued rows has no frontier, so the whole value is `null` and every
-metadata match fails closed until it is scanned — `channels` is there to say
-which one that is.
+`frontier` is the **oldest** of the per-channel `last_scanned_at` values, and it
+is what gates a `NAME_SIZE` match: an entry whose `mtime` is newer than the
+frontier cannot be trusted to have been seen by the scan that vouches for its
+channel. It is deliberately scan time, not message date. A dormant archive
+channel must not pin it: the iPhone migration channel's newest message date
+never advances, but a scan of it today is still current, and frontiering on
+message dates would demote every newer local file forever. An archive channel
+that has not been scanned since freshness started being tracked has no
+`last_scanned_at`, so `frontier` is `null` and every metadata match fails closed
+until it is scanned — `channels` is there to say which one that is.
+
+`newest_message_date` is reported per channel for information only: it is how
+far that channel's own timeline reaches, which is not the same as how fresh the
+catalog is.
 
 `fingerprint_window_bytes` is the window a client must hash at each end of a
 local file for `POST /api/vault/verify` to agree with it. It is the effective
@@ -242,7 +248,7 @@ Response:
 ```json
 {
   "snapshot_id": 7,
-  "catalog": {"newest_message_date": "2026-07-20T00:00:00+00:00", "archive_rows": 4213},
+  "catalog": {"frontier": "2026-09-25T09:00:00+00:00", "archive_rows": 4213},
   "summary": {
     "ARCHIVED": {"files": 4100, "bytes": 812345678},
     "IN_FLIGHT": {"files": 3, "bytes": 9000000},

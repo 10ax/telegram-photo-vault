@@ -335,6 +335,11 @@ class CatalogItem(Base):
     mime_type: Mapped[str | None] = mapped_column(String(128), nullable=True)
     # When it was posted, which for a migrated archive is not when it was shot.
     message_date: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # When this channel was last fully walked. A dormant channel's newest
+    # message never advances, so the message date cannot say how current the
+    # catalog is; the scan time can. NULL means it has not been scanned since
+    # this column existed, which fails the freshness gate closed.
+    scanned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     sha256: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
 
     # A chunked upload appears as N "chunk" messages plus one "manifest" message.
@@ -401,6 +406,7 @@ _COLUMN_MIGRATIONS: dict[str, dict[str, str]] = {
         "chunked_original_name": "VARCHAR(512)",
         "chunked_total_size": "BIGINT",
         "chunked_sha256": "VARCHAR(64)",
+        "scanned_at": "DATETIME",
     },
 }
 

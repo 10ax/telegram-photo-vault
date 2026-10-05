@@ -28,6 +28,7 @@ async def _row(**kwargs):
         channel_role=ChannelRole.ARCHIVE,
         media_kind="document",
         message_date=SCANNED,
+        scanned_at=SCANNED,
     )
     defaults.update(kwargs)
     async with AsyncSessionLocal() as session:
@@ -114,28 +115,52 @@ async def test_an_unscanned_catalog_refuses_to_answer(clean_db):
         await ReconcileService().evaluate([_entry()])
 
 
-async def test_the_oldest_archive_channel_governs_the_freshness_frontier(clean_db):
-    """With two archive channels the newest date overall is the wrong number:
-    it is whichever was scanned most recently, not how far behind the archive
-    is. The frontier is the oldest of them."""
-    await _row(tg_message_id=1, file_name="a.jpg", file_size=100, message_date=OLDER)
+async def test_the_oldest_last_scanned_channel_governs_the_freshness_frontier(clean_db):
+    """With two archive channels the gate is the least recently *walked* one,
+    not the newest message anywhere: a freshly scanned channel must not vouch
+    for one that has not been scanned in months."""
+    await _row(tg_message_id=1, file_name="a.jpg", file_size=100,
+               message_date=SCANNED, scanned_at=OLDER)
     await _row(tg_message_id=1, channel_id=IPHONE, file_name="b.jpg", file_size=100,
-               message_date=SCANNED)
+               message_date=SCANNED, scanned_at=SCANNED)
 
     freshness = await ReconcileService().catalog_freshness()
 
-    assert freshness["newest_message_date"].replace(tzinfo=None) == OLDER.replace(tzinfo=None)
+    assert freshness["frontier"].replace(tzinfo=None) == OLDER.replace(tzinfo=None)
     assert freshness["archive_rows"] == 2
     assert [c["channel_id"] for c in freshness["channels"]] == sorted([ARCHIVE, IPHONE])
+
+
+async def test_a_dormant_channel_scanned_recently_does_not_pin_the_frontier(clean_db):
+    """The iPhone migration's newest message date never advances, but a scan
+    today means the catalog is current as of today. Frontiering on message
+    dates would pin it to the migration date and demote every newer file
+    forever, making NAME_SIZE unreachable."""
+    migration_date = datetime(2026, 8, 18, tzinfo=timezone.utc)
+    scanned_recently = datetime(2026, 9, 25, tzinfo=timezone.utc)
+    await _row(tg_message_id=1, file_name="a.jpg", file_size=100,
+               message_date=migration_date, scanned_at=scanned_recently)
+
+    freshness = await ReconcileService().catalog_freshness()
+
+    assert freshness["frontier"].replace(tzinfo=None) == scanned_recently.replace(tzinfo=None)
+
+    entry = _entry(name="a.jpg", size=100,
+                   mtime=datetime(2026, 9, 1, tzinfo=timezone.utc).isoformat())
+    [decision] = await ReconcileService().evaluate([entry])
+
+    assert decision.verdict is DeviceVerdict.ARCHIVED
+    assert decision.tier is MatchTier.NAME_SIZE
 
 
 async def test_a_freshly_scanned_second_archive_channel_cannot_vouch_for_a_stale_first(clean_db):
     """The most important rule in the design: a photo taken after the last scan
     of *its own* channel must not be declared archived because a different
-    archive channel was migrated yesterday."""
-    await _row(tg_message_id=1, file_name="a.jpg", file_size=100, message_date=OLDER)
+    archive channel was scanned yesterday."""
+    await _row(tg_message_id=1, file_name="a.jpg", file_size=100,
+               message_date=SCANNED, scanned_at=OLDER)
     await _row(tg_message_id=1, channel_id=IPHONE, file_name="b.jpg", file_size=1,
-               message_date=SCANNED)
+               message_date=SCANNED, scanned_at=SCANNED)
 
     entry = _entry(name="a.jpg", size=100,
                    mtime=datetime(2026, 7, 10, tzinfo=timezone.utc).isoformat())
@@ -152,7 +177,7 @@ async def test_a_configured_archive_channel_with_no_rows_fails_everything_closed
     service = ReconcileService(archive_channel_ids=[ARCHIVE, IPHONE])
 
     freshness = await service.catalog_freshness()
-    assert freshness["newest_message_date"] is None
+    assert freshness["frontier"] is None
     assert [c["rows"] for c in freshness["channels"] if c["channel_id"] == IPHONE] == [0]
 
     [decision] = await service.evaluate([_entry()])

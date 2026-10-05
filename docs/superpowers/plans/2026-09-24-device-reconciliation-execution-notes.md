@@ -77,20 +77,20 @@ Recorded because each one is a decision a person might reasonably have made diff
   never touched: that rule was written for a table `create_all` makes whole, and these columns are
   added to one that may already exist on disk.
 
-## Known limitation, parked deliberately
+## The freshness frontier: fixed after execution
 
-**A dormant archive channel pins the freshness frontier forever.** The frontier is
+**A dormant archive channel used to pin the freshness frontier forever.** The frontier was
 `min(max(message_date))` per archive channel. `IPHONE_CHANNEL_ID` is a one-off migration channel
-whose newest message date never advances, so once it is configured every local file newer than the
-migration date is demoted to `IN_FLIGHT` permanently and tier `NAME_SIZE` becomes unreachable.
+whose newest message date never advances, so once it was configured every local file newer than
+the migration date would be demoted to `IN_FLIGHT` permanently and tier `NAME_SIZE` would become
+unreachable.
 
-Inert today — only one archive channel and one mirror are configured, and with a single archive
-channel `min` equals `max`. The direction is fail-closed, so it costs deletions rather than files.
-
-**The correct fix is to track when each channel was last *scanned* and use that as the frontier.**
-A dormant channel scanned yesterday is fresh even though its newest message is old. Worth doing
-before `IPHONE_CHANNEL_ID` is set, because the symptom is that the feature quietly stops
-authorising any deletion at all.
+Fixed by frontiering on **when each channel was last scanned** rather than the newest message it
+contains. `catalog_items.scanned_at` is written once per completed channel walk — a partial walk
+advances nothing — and `catalog_freshness` returns `frontier = min(last_scanned_at)` over the
+archive channels, `None` if any of them has never been scanned. `newest_message_date` survives per
+channel for information only. The fix had to land before `IPHONE_CHANNEL_ID` was set, because the
+symptom is that the feature quietly stops authorising any deletion at all.
 
 ## Smaller things left undone
 
