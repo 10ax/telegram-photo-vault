@@ -36,6 +36,11 @@ def test_defaults_fill_roots_and_chunk_size():
     assert cfg.chunk_size == 2000
 
 
+def test_a_non_numeric_chunk_size_is_a_config_error():
+    with pytest.raises(ConfigError):
+        load_config(env={"VAULT_CHUNK_SIZE": "lots"}, overrides={}, env_file_text=ENV_FILE)
+
+
 def test_env_beats_file_and_overrides_beat_both():
     cfg = load_config(
         env={"VAULT_SERVER": "http://from-env:8000", "VAULT_API_KEY": "env-key"},

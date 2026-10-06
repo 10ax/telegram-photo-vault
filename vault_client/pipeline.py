@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from vault_client import report
+from vault_client.api import ApiError
 from vault_client.enumerate import Entry, enumerate_entries, entry_to_manifest
 from vault_client.hashing import full_sha256, head_tail_sha256
 
@@ -45,15 +46,19 @@ def _finish(config, result, out) -> RunResult:
     return result
 
 
-def _promote_ambiguous(api, verdicts, entries_by_relpath, window, sdcard) -> list[dict]:
+def _promote_ambiguous(api, verdicts, entries_by_relpath, window, sdcard, skipped) -> list[dict]:
     promoted = []
     for verdict in verdicts:
         entry = entries_by_relpath.get(verdict.get("relpath"))
         if entry is None or verdict.get("tg_message_id") is None or verdict.get("channel_id") is None:
             continue
         head, tail = head_tail_sha256(sdcard / entry.relpath, window)
-        body = api.verify(channel_id=verdict["channel_id"], tg_message_id=verdict["tg_message_id"],
-                          file_size=entry.size, head_sha256=head, tail_sha256=tail)
+        try:
+            body = api.verify(channel_id=verdict["channel_id"], tg_message_id=verdict["tg_message_id"],
+                              file_size=entry.size, head_sha256=head, tail_sha256=tail)
+        except ApiError as exc:
+            skipped.append({"relpath": entry.relpath, "reason": f"verify_failed: {exc.detail}"})
+            continue
         if body.get("match"):
             promoted.append({**verdict, "verdict": "ARCHIVED", "tier": "FINGERPRINT"})
     return promoted
@@ -69,6 +74,7 @@ def run(config, *, api, sdcard=None, dry_run=False, yes=False, confirm=None,
         raise PreconditionError("catalog has never been scanned; run a rescan first")
 
     result = RunResult(freshness=freshness)
+    _warn_if_frontier_stale(freshness, now, out)
     result.entries = enumerate_fn(config.roots, sdcard=sdcard)
     entries_by_relpath = {e.relpath: e for e in result.entries}
     manifests = [
@@ -80,10 +86,14 @@ def run(config, *, api, sdcard=None, dry_run=False, yes=False, confirm=None,
         config.device_id, manifests, chunk_size=config.chunk_size,
         taken_at=(now or datetime.now(timezone.utc)).isoformat(),
     )
+    for verdict in result.verdicts:
+        entry = entries_by_relpath.get(verdict.get("relpath"))
+        if entry is not None:
+            verdict["size"] = entry.size
     parts = partition(result.verdicts)
     window = int(freshness.get("fingerprint_window_bytes") or 0)
     result.deletable = parts["ARCHIVED"] + _promote_ambiguous(
-        api, parts["AMBIGUOUS"], entries_by_relpath, window, sdcard
+        api, parts["AMBIGUOUS"], entries_by_relpath, window, sdcard, result.skipped
     )
 
     if not result.deletable:
@@ -99,13 +109,36 @@ def run(config, *, api, sdcard=None, dry_run=False, yes=False, confirm=None,
         out("aborted.")
         return _finish(config, result, out)
 
-    _delete_confirmed(result, entries_by_relpath, sdcard, refresh or _refresh_media_store, out)
+    try:
+        _delete_confirmed(result, entries_by_relpath, sdcard, refresh or _refresh_media_store, out)
+    except BaseException:
+        # An interrupt or error mid-delete must not lose the audit for what
+        # already went; write it, then let the exception propagate.
+        _audit_and_report(config, result, api, out)
+        raise
+    out(f"deleted {len(result.deleted)} file(s); skipped {len(result.skipped)}.")
+    return _audit_and_report(config, result, api, out)
+
+
+def _warn_if_frontier_stale(freshness, now, out) -> None:
+    frontier = freshness.get("frontier")
+    if not frontier:
+        return
+    try:
+        frontier_dt = datetime.fromisoformat(frontier)
+    except (TypeError, ValueError):
+        return
+    reference = now or datetime.now(timezone.utc)
+    if frontier_dt < reference:
+        out(f"warning: catalog frontier {frontier} is in the past; recent files will be held IN_FLIGHT")
+
+
+def _audit_and_report(config, result, api, out) -> RunResult:
     if result.deleted:
         try:
             api.deletions(config.device_id, result.deleted)
         except Exception as exc:  # the bytes are already gone; the audit is best-effort
             out(f"warning: could not record deletion audit: {exc}")
-    out(f"deleted {len(result.deleted)} file(s); skipped {len(result.skipped)}.")
     return _finish(config, result, out)
 
 
@@ -114,7 +147,8 @@ def _unchanged(path, entry: Entry) -> bool:
         stat = path.stat()
     except FileNotFoundError:
         return False
-    return stat.st_size == entry.size and abs(stat.st_mtime - entry.mtime.timestamp()) < 1.0
+    return (stat.st_size == entry.size
+            and datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc) == entry.mtime)
 
 
 def _refresh_media_store(paths, *, runner=subprocess.run) -> None:
@@ -128,16 +162,23 @@ def _refresh_media_store(paths, *, runner=subprocess.run) -> None:
 
 def _delete_confirmed(result, entries_by_relpath, sdcard, refresh, out) -> None:
     for verdict in result.deletable:
-        entry = entries_by_relpath[verdict["relpath"]]
-        path = sdcard / entry.relpath
-        if not _unchanged(path, entry):
-            result.skipped.append({"relpath": entry.relpath, "reason": "changed_or_missing"})
-            out(f"skipped (changed or already gone): {entry.relpath}")
+        entry = entries_by_relpath.get(verdict.get("relpath"))
+        if entry is None:
+            result.skipped.append({"relpath": verdict.get("relpath"), "reason": "not_enumerated"})
             continue
+        path = sdcard / entry.relpath
         try:
+            if not _unchanged(path, entry):
+                result.skipped.append({"relpath": entry.relpath, "reason": "changed_or_missing"})
+                out(f"skipped (changed or already gone): {entry.relpath}")
+                continue
             path.unlink()
         except FileNotFoundError:
             result.skipped.append({"relpath": entry.relpath, "reason": "already_gone"})
+            continue
+        except OSError as exc:
+            result.skipped.append({"relpath": entry.relpath, "reason": f"io_error: {exc}"})
+            out(f"skipped (io error): {entry.relpath}: {exc}")
             continue
         result.deleted.append({
             "relpath": entry.relpath, "name": entry.name, "size": entry.size,

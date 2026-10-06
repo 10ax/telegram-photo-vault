@@ -74,8 +74,13 @@ def load_config(
         raise ConfigError(f"missing required setting(s): {', '.join(missing)}")
 
     roots = tuple(Path(p.strip()) for p in (value("roots") or DEFAULT_ROOTS).split(",") if p.strip())
+    chunk_size_raw = value("chunk_size")
+    try:
+        chunk_size = int(chunk_size_raw or DEFAULT_CHUNK_SIZE)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"invalid VAULT_CHUNK_SIZE: {chunk_size_raw!r}") from exc
     return Config(
         server=server, device_id=device_id, api_key=api_key,
         roots=roots, report_dir=Path(value("report_dir") or DEFAULT_REPORT_DIR),
-        chunk_size=int(value("chunk_size") or DEFAULT_CHUNK_SIZE),
+        chunk_size=chunk_size,
     )

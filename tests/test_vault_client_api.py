@@ -109,3 +109,18 @@ def test_reconcile_all_returns_empty_without_any_call():
     api = VaultApi(SERVER, "k", transport=transport)
     assert api.reconcile_all("pixel", []) == []
     assert transport.calls == []
+
+
+def test_reconcile_all_rejects_a_summary_that_disagrees_with_what_was_sent():
+    transport = FakeTransport([
+        (200, json.dumps({
+            "snapshot_id": 7,
+            "entries": _verdicts(["a.jpg"]),
+            "summary": {"total_files": 1},
+        }).encode()),
+    ])
+    api = VaultApi(SERVER, "k", transport=transport)
+    with pytest.raises(ApiError) as caught:
+        api.reconcile_all("pixel", [{"name": "a.jpg"}, {"name": "b.jpg"}], chunk_size=2)
+    assert caught.value.status == 500
+    assert "summary mismatch" in caught.value.detail

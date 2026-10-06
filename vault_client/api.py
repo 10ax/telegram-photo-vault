@@ -23,6 +23,8 @@ def _default_transport(method, url, headers, body, timeout=30.0):
             return response.status, response.read()
     except urllib.error.HTTPError as exc:
         return exc.code, exc.read()
+    except (urllib.error.URLError, OSError) as exc:
+        raise ApiError(0, f"server unreachable: {exc}") from exc
 
 
 class VaultApi:
@@ -73,6 +75,7 @@ class VaultApi:
         entries = list(entries)
         verdicts: list[dict] = []
         snapshot_id = None
+        total_files = None
         index = 0
         size = max(1, chunk_size)
         while index < len(entries):
@@ -86,6 +89,11 @@ class VaultApi:
                     continue
                 raise
             snapshot_id = body.get("snapshot_id", snapshot_id)
+            summary = body.get("summary") or {}
+            if summary.get("total_files") is not None:
+                total_files = summary["total_files"]
             verdicts.extend(body.get("entries", []))
             index += len(chunk)
+        if total_files is not None and total_files != len(entries):
+            raise ApiError(500, f"reconcile summary mismatch: server reported {total_files} of {len(entries)}")
         return verdicts

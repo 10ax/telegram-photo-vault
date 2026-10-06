@@ -4,6 +4,7 @@ import os
 import pytest
 
 from vault_client import pipeline
+from vault_client.api import ApiError
 from vault_client.config import Config
 
 
@@ -252,6 +253,87 @@ def test_a_file_missing_at_delete_time_is_skipped_not_deleted(tmp_path):
     assert result.deleted == []
     assert [s["relpath"] for s in result.skipped] == ["DCIM/a.jpg"]
     assert result.skipped[0]["reason"] == "changed_or_missing"
+
+
+def test_an_io_error_on_one_file_does_not_abort_the_rest(tmp_path):
+    from vault_client import enumerate as ve
+
+    (tmp_path / "DCIM").mkdir()
+    (tmp_path / "DCIM" / "good.jpg").write_bytes(b"x" * 4)
+    bad = tmp_path / "DCIM" / "bad.jpg"
+    bad.mkdir()
+    (bad / "child").write_bytes(b"y")  # non-empty dir: unlink raises IsADirectoryError
+    verdicts = [
+        _verdict("good.jpg", "ARCHIVED", tier="NAME_SIZE", channel_id=-1, tg_message_id=1),
+        _verdict("bad.jpg", "ARCHIVED", tier="NAME_SIZE", channel_id=-1, tg_message_id=2),
+    ]
+    api = FakeApi(FRESH, verdicts)
+
+    def with_unlinkable(roots, *, sdcard):
+        entries = ve.enumerate_entries(roots, sdcard=sdcard)
+        st = bad.stat()
+        entries.append(ve.Entry("DCIM/bad.jpg", "bad.jpg", st.st_size,
+                                datetime.fromtimestamp(st.st_mtime, tz=timezone.utc)))
+        return entries
+
+    result = pipeline.run(_config(tmp_path), sdcard=tmp_path, api=api, yes=True,
+                          confirm=lambda _: True, enumerate_fn=with_unlinkable,
+                          refresh=lambda paths: None)
+
+    assert not (tmp_path / "DCIM" / "good.jpg").exists()
+    assert [d["relpath"] for d in result.deleted] == ["DCIM/good.jpg"]
+    assert any(s["relpath"] == "DCIM/bad.jpg" and s["reason"].startswith("io_error")
+               for s in result.skipped)
+    assert api.deletion_calls and [d["relpath"] for d in api.deletion_calls[0]] == ["DCIM/good.jpg"]
+
+
+def test_audit_and_report_run_even_when_deletion_raises(tmp_path):
+    (tmp_path / "DCIM").mkdir()
+    (tmp_path / "DCIM" / "a.jpg").write_bytes(b"x" * 4)
+    verdicts = [_verdict("a.jpg", "ARCHIVED", tier="NAME_SIZE", channel_id=-1, tg_message_id=1)]
+    api = FakeApi(FRESH, verdicts)
+
+    def boom(paths):
+        raise RuntimeError("boom")
+
+    with pytest.raises(RuntimeError, match="boom"):
+        pipeline.run(_config(tmp_path), sdcard=tmp_path, api=api, yes=True,
+                     confirm=lambda _: True, refresh=boom)
+
+    assert api.deletion_calls and api.deletion_calls[0][0]["relpath"] == "DCIM/a.jpg"
+    assert list(tmp_path.glob("*.json")), "the report must still be written"
+
+
+def test_a_vanished_archived_message_is_reported_not_promoted(tmp_path):
+    (tmp_path / "DCIM").mkdir()
+    (tmp_path / "DCIM" / "c.jpg").write_bytes(b"hi")
+    verdicts = [_verdict("c.jpg", "AMBIGUOUS", reason="case_only_match", channel_id=-1, tg_message_id=9)]
+
+    class GoneApi(FakeApi):
+        def verify(self, **kwargs):
+            self.verify_calls.append(kwargs)
+            raise ApiError(404, "message gone")
+
+    api = GoneApi(FRESH, verdicts)
+
+    result = pipeline.run(_config(tmp_path), sdcard=tmp_path, api=api, dry_run=True,
+                          yes=False, confirm=lambda _: False)
+
+    assert result.deletable == []
+    assert any(s["relpath"] == "DCIM/c.jpg" and s["reason"].startswith("verify_failed")
+               for s in result.skipped)
+
+
+def test_archived_bytes_are_totalled_in_the_summary(tmp_path):
+    (tmp_path / "DCIM").mkdir()
+    (tmp_path / "DCIM" / "a.jpg").write_bytes(b"x" * 37)
+    verdicts = [_verdict("a.jpg", "ARCHIVED", tier="NAME_SIZE", channel_id=-1, tg_message_id=1)]
+    api = FakeApi(FRESH, verdicts)
+
+    result = pipeline.run(_config(tmp_path), sdcard=tmp_path, api=api, dry_run=True,
+                          yes=False, confirm=lambda _: False)
+
+    assert result.summary["ARCHIVED"]["bytes"] == 37
 
 
 def test_a_failing_deletion_audit_is_best_effort(tmp_path):

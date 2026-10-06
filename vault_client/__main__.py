@@ -22,7 +22,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def main(argv: list[str] | None = None, *, config_loader=load_config) -> int:
+def main(argv: list[str] | None = None, *, config_loader=load_config, api_factory=VaultApi) -> int:
     args = parse_args(argv)
     overrides = {name: getattr(args, name) for name in ("server", "device_id", "roots")
                  if getattr(args, name)}
@@ -32,10 +32,12 @@ def main(argv: list[str] | None = None, *, config_loader=load_config) -> int:
         print(f"config error: {exc}", file=sys.stderr)
         return 2
 
-    api = VaultApi(config.server, config.api_key)
+    api = api_factory(config.server, config.api_key)
+    out = (lambda *args, **kwargs: None) if args.json else print
     try:
-        result = run(config, api=api, dry_run=args.dry_run, yes=args.yes, hash_files=args.hash)
-    except (PreconditionError, ApiError) as exc:
+        result = run(config, api=api, dry_run=args.dry_run, yes=args.yes,
+                     hash_files=args.hash, out=out)
+    except (PreconditionError, ApiError, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 3
     except KeyboardInterrupt:
