@@ -88,3 +88,24 @@ def test_reconcile_all_halves_the_chunk_when_the_server_says_413():
     out = api.reconcile_all("pixel", [{"name": n} for n in names], chunk_size=4)
     assert [v["name"] for v in out] == names
     assert len(transport.calls) == 3
+    split = json.loads(transport.calls[1]["body"])
+    assert split["snapshot_id"] is None
+    assert split["entries"] == [{"name": n} for n in names[:2]]
+    assert split["final"] is False
+
+
+def test_reconcile_all_propagates_a_non_413_apierror_without_retrying():
+    names = [f"f{i}.jpg" for i in range(4)]
+    transport = FakeTransport([(409, b'{"detail": "catalog has never been scanned"}')])
+    api = VaultApi(SERVER, "k", transport=transport)
+    with pytest.raises(ApiError) as caught:
+        api.reconcile_all("pixel", [{"name": n} for n in names], chunk_size=2)
+    assert caught.value.status == 409
+    assert len(transport.calls) == 1
+
+
+def test_reconcile_all_returns_empty_without_any_call():
+    transport = FakeTransport([])
+    api = VaultApi(SERVER, "k", transport=transport)
+    assert api.reconcile_all("pixel", []) == []
+    assert transport.calls == []
