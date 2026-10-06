@@ -97,3 +97,16 @@ def test_dry_run_never_deletes_even_when_confirmed(tmp_path):
 
     assert (tmp_path / "DCIM" / "a.jpg").exists()
     assert result.deleted == []
+
+
+def test_a_declined_confirmation_deletes_nothing(tmp_path):
+    (tmp_path / "DCIM").mkdir()
+    (tmp_path / "DCIM" / "a.jpg").write_bytes(b"x" * 4)
+    verdicts = [_verdict("a.jpg", "ARCHIVED", tier="NAME_SIZE", channel_id=-1, tg_message_id=1)]
+    api = FakeApi(FRESH, verdicts)
+
+    result = pipeline.run(_config(tmp_path), sdcard=tmp_path, api=api, dry_run=False,
+                          yes=False, confirm=lambda _: False)
+
+    assert (tmp_path / "DCIM" / "a.jpg").exists()
+    assert result.deleted == []
