@@ -62,3 +62,30 @@ class VaultApi:
 
     def deletions(self, device_id, records) -> dict:
         return self.request("POST", f"/api/devices/{device_id}/deletions", {"deleted": list(records)})
+
+    def reconcile_all(self, device_id, entries, *, chunk_size: int = 2000, taken_at=None) -> list[dict]:
+        """Reconcile every entry, paginating with snapshot_id.
+
+        A 413 refuses the batch before anything is recorded, so it is safe to
+        split and retry against the same snapshot. Any other failure propagates:
+        a retried reconcile would double-count the snapshot.
+        """
+        entries = list(entries)
+        verdicts: list[dict] = []
+        snapshot_id = None
+        index = 0
+        size = max(1, chunk_size)
+        while index < len(entries):
+            chunk = entries[index:index + size]
+            final = index + size >= len(entries)
+            try:
+                body = self.reconcile(device_id, chunk, snapshot_id=snapshot_id, taken_at=taken_at, final=final)
+            except ApiError as exc:
+                if exc.status == 413 and size > 1:
+                    size = max(1, size // 2)
+                    continue
+                raise
+            snapshot_id = body.get("snapshot_id", snapshot_id)
+            verdicts.extend(body.get("entries", []))
+            index += len(chunk)
+        return verdicts

@@ -54,3 +54,37 @@ def test_a_non_2xx_becomes_an_apierror_with_status_and_detail():
         api.freshness()
     assert caught.value.status == 409
     assert "never been scanned" in caught.value.detail
+
+
+def _verdicts(names):
+    return [{"relpath": n, "name": n, "verdict": "ARCHIVED", "tier": "NAME_SIZE",
+             "reason": None, "channel_id": -1, "tg_message_id": 1} for n in names]
+
+
+def test_reconcile_all_paginates_with_a_snapshot_id_and_finalises_at_the_end():
+    names = [f"f{i}.jpg" for i in range(5)]
+    transport = FakeTransport([
+        (200, json.dumps({"snapshot_id": 7, "entries": _verdicts(names[:2])}).encode()),
+        (200, json.dumps({"snapshot_id": 7, "entries": _verdicts(names[2:4])}).encode()),
+        (200, json.dumps({"snapshot_id": 7, "entries": _verdicts(names[4:])}).encode()),
+    ])
+    api = VaultApi(SERVER, "k", transport=transport)
+    out = api.reconcile_all("pixel", [{"name": n} for n in names], chunk_size=2)
+    assert [v["name"] for v in out] == names
+    sent = [json.loads(c["body"]) for c in transport.calls]
+    assert sent[0]["snapshot_id"] is None and sent[0]["final"] is False
+    assert sent[1]["snapshot_id"] == 7 and sent[1]["final"] is False
+    assert sent[2]["snapshot_id"] == 7 and sent[2]["final"] is True
+
+
+def test_reconcile_all_halves_the_chunk_when_the_server_says_413():
+    names = [f"f{i}.jpg" for i in range(4)]
+    transport = FakeTransport([
+        (413, b'{"detail": "too many entries"}'),
+        (200, json.dumps({"snapshot_id": 7, "entries": _verdicts(names[:2])}).encode()),
+        (200, json.dumps({"snapshot_id": 7, "entries": _verdicts(names[2:])}).encode()),
+    ])
+    api = VaultApi(SERVER, "k", transport=transport)
+    out = api.reconcile_all("pixel", [{"name": n} for n in names], chunk_size=4)
+    assert [v["name"] for v in out] == names
+    assert len(transport.calls) == 3
