@@ -1,6 +1,7 @@
-"""One cleanup run: inventory -> verdicts -> verify -> review -> (Task 7) delete."""
+"""One cleanup run: inventory -> verdicts -> verify -> review -> delete."""
 from __future__ import annotations
 
+import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -84,8 +85,54 @@ def run(config, *, api, sdcard=None, dry_run=False, yes=False, confirm=None,
     if not (yes or confirm(f"Delete {len(result.deletable)} file(s)?")):
         out("aborted.")
         return result
-    # Task 7 replaces this line with the guarded delete + audit.
+
+    _delete_confirmed(result, entries_by_relpath, sdcard, refresh or _refresh_media_store, out)
+    if result.deleted:
+        try:
+            api.deletions(config.device_id, result.deleted)
+        except Exception as exc:  # the bytes are already gone; the audit is best-effort
+            out(f"warning: could not record deletion audit: {exc}")
+    out(f"deleted {len(result.deleted)} file(s); skipped {len(result.skipped)}.")
     return result
+
+
+def _unchanged(path, entry: Entry) -> bool:
+    try:
+        stat = path.stat()
+    except FileNotFoundError:
+        return False
+    return stat.st_size == entry.size and abs(stat.st_mtime - entry.mtime.timestamp()) < 1.0
+
+
+def _refresh_media_store(paths, *, runner=subprocess.run) -> None:
+    """Best-effort: tell Android the deleted paths are gone, once per directory."""
+    for directory in sorted({str(Path(p).parent) for p in paths}):
+        try:
+            runner(["termux-media-scan", "-r", directory], check=False, capture_output=True)
+        except Exception:
+            pass
+
+
+def _delete_confirmed(result, entries_by_relpath, sdcard, refresh, out) -> None:
+    for verdict in result.deletable:
+        entry = entries_by_relpath[verdict["relpath"]]
+        path = sdcard / entry.relpath
+        if not _unchanged(path, entry):
+            result.skipped.append({"relpath": entry.relpath, "reason": "changed_or_missing"})
+            out(f"skipped (changed or already gone): {entry.relpath}")
+            continue
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            result.skipped.append({"relpath": entry.relpath, "reason": "already_gone"})
+            continue
+        result.deleted.append({
+            "relpath": entry.relpath, "name": entry.name, "size": entry.size,
+            "tier": verdict.get("tier"), "channel_id": verdict.get("channel_id"),
+            "tg_message_id": verdict.get("tg_message_id"),
+            "deleted_at": datetime.now(timezone.utc).isoformat(),
+        })
+    refresh([str(sdcard / d["relpath"]) for d in result.deleted])
 
 
 def _input_confirm(prompt: str) -> bool:

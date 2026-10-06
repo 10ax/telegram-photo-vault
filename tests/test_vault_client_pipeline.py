@@ -1,3 +1,5 @@
+from datetime import datetime, timezone
+
 import pytest
 
 from vault_client import pipeline
@@ -110,3 +112,53 @@ def test_a_declined_confirmation_deletes_nothing(tmp_path):
 
     assert (tmp_path / "DCIM" / "a.jpg").exists()
     assert result.deleted == []
+
+
+def test_confirmed_deletion_removes_files_and_records_the_audit(tmp_path):
+    (tmp_path / "DCIM").mkdir()
+    (tmp_path / "DCIM" / "a.jpg").write_bytes(b"x" * 4)
+    verdicts = [_verdict("a.jpg", "ARCHIVED", tier="NAME_SIZE", channel_id=-1, tg_message_id=1)]
+    api = FakeApi(FRESH, verdicts)
+
+    result = pipeline.run(_config(tmp_path), sdcard=tmp_path, api=api, yes=True,
+                          confirm=lambda _: True, refresh=lambda paths: None)
+
+    assert not (tmp_path / "DCIM" / "a.jpg").exists()
+    assert result.deleted[0]["relpath"] == "DCIM/a.jpg"
+    assert result.deleted[0]["tier"] == "NAME_SIZE"
+    assert result.deleted[0]["channel_id"] == -1
+    assert result.deleted[0]["tg_message_id"] == 1
+    assert api.deletion_calls and api.deletion_calls[0][0]["relpath"] == "DCIM/a.jpg"
+
+
+def test_a_file_changed_since_enumeration_is_skipped_not_deleted(tmp_path):
+    from vault_client import enumerate as ve
+
+    (tmp_path / "DCIM").mkdir()
+    verdicts = [_verdict("a.jpg", "ARCHIVED", tier="NAME_SIZE", channel_id=-1, tg_message_id=1)]
+    api = FakeApi(FRESH, verdicts)
+
+    def rivalrous_enumerate(roots, *, sdcard):
+        # Enumerate reports 4 bytes; the file grows to 99 before deletion runs.
+        (tmp_path / "DCIM" / "a.jpg").write_bytes(b"x" * 99)
+        return [ve.Entry("DCIM/a.jpg", "a.jpg", 4, datetime.now(timezone.utc))]
+
+    result = pipeline.run(_config(tmp_path), sdcard=tmp_path, api=api, yes=True,
+                          confirm=lambda _: True, enumerate_fn=rivalrous_enumerate,
+                          refresh=lambda paths: None)
+
+    assert (tmp_path / "DCIM" / "a.jpg").exists(), "a changed file must not be deleted"
+    assert result.deleted == []
+    assert result.skipped[0]["relpath"] == "DCIM/a.jpg"
+
+
+def test_media_store_refresh_runs_the_scan_once_per_directory():
+    calls = []
+    pipeline._refresh_media_store(
+        ["/sdcard/DCIM/Camera/a.jpg", "/sdcard/DCIM/Camera/b.jpg", "/sdcard/Pictures/c.jpg"],
+        runner=lambda *args, **kwargs: calls.append(args),
+    )
+    assert calls == [
+        (["termux-media-scan", "-r", "/sdcard/DCIM/Camera"],),
+        (["termux-media-scan", "-r", "/sdcard/Pictures"],),
+    ]
