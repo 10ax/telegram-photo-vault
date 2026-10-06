@@ -5,6 +5,11 @@ on:
     branches: ["**"]
   pull_request:
 
+# The test job only reads the repository: checkout, install, lint, test.
+# Deny everything the token could otherwise do (push, edit releases, ...).
+permissions:
+  contents: read
+
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -14,6 +19,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          # Nothing here pushes, so don't leave an authenticated remote in
+          # .git/config for later steps to use.
+          persist-credentials: false
 
       - uses: actions/setup-python@v7
         with:
