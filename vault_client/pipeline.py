@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
+from vault_client import report
 from vault_client.enumerate import Entry, enumerate_entries, entry_to_manifest
 from vault_client.hashing import full_sha256, head_tail_sha256
 
@@ -30,6 +31,18 @@ def partition(verdicts: list[dict]) -> dict[str, list[dict]]:
     for verdict in verdicts:
         parts.setdefault(verdict.get("verdict", "NOT_ARCHIVED"), []).append(verdict)
     return parts
+
+
+def _finish(config, result, out) -> RunResult:
+    result.summary = report.summarize(result.verdicts)
+    payload = {"deletable": result.deletable, "deleted": result.deleted,
+               "skipped": result.skipped, "summary": result.summary}
+    try:
+        report.write_report(config.report_dir, payload)
+    except OSError as exc:
+        out(f"warning: could not write report: {exc}")
+    out(report.render_human(result))
+    return result
 
 
 def _promote_ambiguous(api, verdicts, entries_by_relpath, window, sdcard) -> list[dict]:
@@ -75,16 +88,16 @@ def run(config, *, api, sdcard=None, dry_run=False, yes=False, confirm=None,
 
     if not result.deletable:
         out("Nothing is safe to delete.")
-        return result
+        return _finish(config, result, out)
 
     total = sum(entries_by_relpath[v["relpath"]].size for v in result.deletable)
     out(f"{len(result.deletable)} file(s), {total} bytes reclaimable.")
     if dry_run:
         out("dry run: nothing deleted.")
-        return result
+        return _finish(config, result, out)
     if not (yes or confirm(f"Delete {len(result.deletable)} file(s)?")):
         out("aborted.")
-        return result
+        return _finish(config, result, out)
 
     _delete_confirmed(result, entries_by_relpath, sdcard, refresh or _refresh_media_store, out)
     if result.deleted:
@@ -93,7 +106,7 @@ def run(config, *, api, sdcard=None, dry_run=False, yes=False, confirm=None,
         except Exception as exc:  # the bytes are already gone; the audit is best-effort
             out(f"warning: could not record deletion audit: {exc}")
     out(f"deleted {len(result.deleted)} file(s); skipped {len(result.skipped)}.")
-    return result
+    return _finish(config, result, out)
 
 
 def _unchanged(path, entry: Entry) -> bool:
