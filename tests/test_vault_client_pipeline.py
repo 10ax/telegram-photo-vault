@@ -45,6 +45,24 @@ def _verdict(name, verdict, **extra):
     return base
 
 
+def test_a_report_write_failure_is_best_effort(tmp_path):
+    (tmp_path / "DCIM").mkdir()
+    (tmp_path / "DCIM" / "a.jpg").write_bytes(b"x" * 4)
+    (tmp_path / "blocked").write_text("not a directory")
+    config = Config(server="http://x", device_id="pixel", api_key="k",
+                    roots=(tmp_path / "DCIM",), report_dir=tmp_path / "blocked")
+    verdicts = [_verdict("a.jpg", "ARCHIVED", tier="NAME_SIZE", channel_id=-1, tg_message_id=1)]
+    api = FakeApi(FRESH, verdicts)
+    calls = []
+
+    result = pipeline.run(config, sdcard=tmp_path, api=api, dry_run=True,
+                          yes=True, confirm=lambda _: True, out=calls.append)
+
+    assert (tmp_path / "DCIM" / "a.jpg").exists()
+    assert result.deleted == []
+    assert any(c.startswith("warning: could not write report") for c in calls)
+
+
 def test_partition_splits_verdicts_by_value():
     parts = pipeline.partition([
         _verdict("a", "ARCHIVED"), _verdict("b", "IN_FLIGHT"),

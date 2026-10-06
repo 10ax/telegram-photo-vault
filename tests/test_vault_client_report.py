@@ -16,6 +16,13 @@ def test_summarize_counts_and_bytes_per_verdict():
     assert summary["TOTAL"] == {"files": 3, "bytes": 16}
 
 
+def test_summarize_handles_unknown_and_missing_fields():
+    summary = report.summarize([{"verdict": "WEIRD"}, {"size": None}, {}])
+    assert summary["WEIRD"] == {"files": 1, "bytes": 0}
+    assert summary["NOT_ARCHIVED"] == {"files": 2, "bytes": 0}
+    assert summary["TOTAL"] == {"files": 3, "bytes": 0}
+
+
 def test_write_report_creates_a_timestamped_json_file(tmp_path):
     path = report.write_report(tmp_path, {"deleted": 2},
                                now=datetime(2026, 10, 6, 12, 0, tzinfo=timezone.utc))
