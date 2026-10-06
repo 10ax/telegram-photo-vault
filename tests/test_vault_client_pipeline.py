@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+import os
 
 import pytest
 
@@ -162,3 +163,92 @@ def test_media_store_refresh_runs_the_scan_once_per_directory():
         (["termux-media-scan", "-r", "/sdcard/DCIM/Camera"],),
         (["termux-media-scan", "-r", "/sdcard/Pictures"],),
     ]
+
+
+def test_confirmed_run_deletes_only_archived_and_leaves_other_verdicts_alone(tmp_path):
+    (tmp_path / "DCIM").mkdir()
+    for name in ("keep.jpg", "flight.jpg", "plain.jpg", "ambig.jpg"):
+        (tmp_path / "DCIM" / name).write_bytes(b"x" * 4)
+    (tmp_path / "DCIM" / "gone.jpg").write_bytes(b"x" * 4)
+    verdicts = [
+        _verdict("gone.jpg", "ARCHIVED", tier="NAME_SIZE", channel_id=-1, tg_message_id=1),
+        _verdict("keep.jpg", "IN_FLIGHT", channel_id=-1, tg_message_id=2),
+        _verdict("flight.jpg", "NOT_ARCHIVED"),
+        _verdict("plain.jpg", "AMBIGUOUS", reason="size_mismatch"),
+        _verdict("ambig.jpg", "AMBIGUOUS", reason="size_mismatch", channel_id=-1, tg_message_id=None),
+    ]
+    api = FakeApi(FRESH, verdicts)
+
+    result = pipeline.run(_config(tmp_path), sdcard=tmp_path, api=api, yes=True,
+                          confirm=lambda _: True, refresh=lambda paths: None)
+
+    assert not (tmp_path / "DCIM" / "gone.jpg").exists()
+    for name in ("keep.jpg", "flight.jpg", "plain.jpg", "ambig.jpg"):
+        assert (tmp_path / "DCIM" / name).exists(), f"{name} must survive a confirmed run"
+    assert [d["relpath"] for d in result.deleted] == ["DCIM/gone.jpg"]
+
+
+def test_a_file_with_same_size_but_new_mtime_is_skipped_not_deleted(tmp_path):
+    from vault_client import enumerate as ve
+
+    (tmp_path / "DCIM").mkdir()
+    path = tmp_path / "DCIM" / "a.jpg"
+    path.write_bytes(b"x" * 4)
+    verdicts = [_verdict("a.jpg", "ARCHIVED", tier="NAME_SIZE", channel_id=-1, tg_message_id=1)]
+    api = FakeApi(FRESH, verdicts)
+
+    def rivalrous_enumerate(roots, *, sdcard):
+        entries = ve.enumerate_entries(roots, sdcard=sdcard)
+        later = datetime.now(timezone.utc).timestamp() + 5
+        os.utime(path, (later, later))  # same size, newer mtime
+        return entries
+
+    result = pipeline.run(_config(tmp_path), sdcard=tmp_path, api=api, yes=True,
+                          confirm=lambda _: True, enumerate_fn=rivalrous_enumerate,
+                          refresh=lambda paths: None)
+
+    assert path.exists(), "a file touched after enumeration must not be deleted"
+    assert result.deleted == []
+    assert result.skipped[0]["relpath"] == "DCIM/a.jpg"
+
+
+def test_a_file_missing_at_delete_time_is_skipped_not_deleted(tmp_path):
+    from vault_client import enumerate as ve
+
+    (tmp_path / "DCIM").mkdir()
+    path = tmp_path / "DCIM" / "a.jpg"
+    path.write_bytes(b"x" * 4)
+    verdicts = [_verdict("a.jpg", "ARCHIVED", tier="NAME_SIZE", channel_id=-1, tg_message_id=1)]
+    api = FakeApi(FRESH, verdicts)
+
+    def vanishing_enumerate(roots, *, sdcard):
+        entries = ve.enumerate_entries(roots, sdcard=sdcard)
+        path.unlink()  # someone else removed it before deletion runs
+        return entries
+
+    result = pipeline.run(_config(tmp_path), sdcard=tmp_path, api=api, yes=True,
+                          confirm=lambda _: True, enumerate_fn=vanishing_enumerate,
+                          refresh=lambda paths: None)
+
+    assert not path.exists()
+    assert result.deleted == []
+    assert [s["relpath"] for s in result.skipped] == ["DCIM/a.jpg"]
+    assert result.skipped[0]["reason"] == "changed_or_missing"
+
+
+def test_a_failing_deletion_audit_is_best_effort(tmp_path):
+    (tmp_path / "DCIM").mkdir()
+    (tmp_path / "DCIM" / "a.jpg").write_bytes(b"x" * 4)
+    verdicts = [_verdict("a.jpg", "ARCHIVED", tier="NAME_SIZE", channel_id=-1, tg_message_id=1)]
+
+    class RaisingApi(FakeApi):
+        def deletions(self, device_id, records):
+            raise RuntimeError("audit endpoint down")
+
+    api = RaisingApi(FRESH, verdicts)
+
+    result = pipeline.run(_config(tmp_path), sdcard=tmp_path, api=api, yes=True,
+                          confirm=lambda _: True, refresh=lambda paths: None)
+
+    assert not (tmp_path / "DCIM" / "a.jpg").exists()
+    assert [d["relpath"] for d in result.deleted] == ["DCIM/a.jpg"]
