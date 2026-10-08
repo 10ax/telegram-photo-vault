@@ -90,10 +90,11 @@ class VaultApi:
                 raise
             snapshot_id = body.get("snapshot_id", snapshot_id)
             summary = body.get("summary") or {}
-            if summary.get("total_files") is not None:
-                total_files = summary["total_files"]
+            sent_total = (summary.get("TOTAL") or {}).get("files")
+            if sent_total is not None:
+                total_files = sent_total
             verdicts.extend(body.get("entries", []))
             index += len(chunk)
         if total_files is not None and total_files != len(entries):
-            raise ApiError(500, f"reconcile summary mismatch: server reported {total_files} of {len(entries)}")
+            raise ApiError(500, f"reconcile summary mismatch: server reported {total_files} of {len(entries)} entries")
         return verdicts

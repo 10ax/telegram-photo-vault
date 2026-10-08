@@ -116,7 +116,7 @@ def test_reconcile_all_rejects_a_summary_that_disagrees_with_what_was_sent():
         (200, json.dumps({
             "snapshot_id": 7,
             "entries": _verdicts(["a.jpg"]),
-            "summary": {"total_files": 1},
+            "summary": {"TOTAL": {"files": 1, "bytes": 10}},
         }).encode()),
     ])
     api = VaultApi(SERVER, "k", transport=transport)
@@ -124,3 +124,16 @@ def test_reconcile_all_rejects_a_summary_that_disagrees_with_what_was_sent():
         api.reconcile_all("pixel", [{"name": "a.jpg"}, {"name": "b.jpg"}], chunk_size=2)
     assert caught.value.status == 500
     assert "summary mismatch" in caught.value.detail
+
+
+def test_reconcile_all_accepts_a_summary_that_agrees_with_what_was_sent():
+    transport = FakeTransport([
+        (200, json.dumps({
+            "snapshot_id": 7,
+            "entries": _verdicts(["a.jpg", "b.jpg"]),
+            "summary": {"TOTAL": {"files": 2, "bytes": 20}},
+        }).encode()),
+    ])
+    api = VaultApi(SERVER, "k", transport=transport)
+    out = api.reconcile_all("pixel", [{"name": "a.jpg"}, {"name": "b.jpg"}], chunk_size=2)
+    assert [v["name"] for v in out] == ["a.jpg", "b.jpg"]
